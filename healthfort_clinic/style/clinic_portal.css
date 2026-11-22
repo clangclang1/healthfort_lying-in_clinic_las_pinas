@@ -1,0 +1,212 @@
+:root {
+    --primary: #0ea5e9;
+    --primary-dark: #0284c7;
+    --admin: #6366f1;
+    --admin-dark: #4f46e5;
+    --bg-color: #f8fafc;
+    --card-bg: #ffffff;
+    --text-main: #1e293b;
+    --text-muted: #64748b;
+    --border: #e2e8f0;
+    --page-bg: #f1f5f9;
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+body {
+    background:
+        radial-gradient(ellipse at top, rgba(14, 165, 233, 0.06), transparent 55%),
+        var(--bg-color);
+    color: var(--text-main);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    padding: clamp(16px, 4vw, 40px);
+}
+
+.portal-container {
+    width: 100%;
+    max-width: 960px;
+    background: var(--card-bg);
+    border: 1px solid rgba(226, 232, 240, 0.8);
+    border-radius: 20px;
+    box-shadow: 0 24px 60px -32px rgba(15, 23, 42, 0.28);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+.portal-header {
+    text-align: center;
+    padding: 36px 24px 18px;
+}
+
+.portal-header img {
+    display: block;
+    width: min(240px, 70vw);
+    height: auto;
+    margin: 0 auto;
+}
+
+.portal-header p {
+    color: var(--text-muted);
+    font-size: 14px;
+}
+
+.role-selection {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 20px;
+    padding: 18px 36px 36px;
+}
+
+@media (max-width: 768px) {
+    .role-selection {
+        grid-template-columns: 1fr;
+        gap: 16px;
+        padding: 16px 24px 28px;
+    }
+}
+
+.role-card {
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 28px 24px 24px;
+    text-align: center;
+    cursor: pointer;
+    transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+    background: linear-gradient(160deg, #fff, #fbfdff);
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    min-height: 230px;
+}
+
+.role-card:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 16px 28px -16px rgba(15, 23, 42, 0.28);
+}
+
+.role-card.patient:hover {
+    border-color: var(--primary);
+}
+
+.role-card.admin:hover {
+    border-color: var(--admin);
+}
+
+.role-icon {
+    width: 60px;
+    height: 60px;
+    margin: 0 auto 16px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 24px;
+}
+
+.role-card.patient .role-icon {
+    background-color: #e0f2fe;
+    color: var(--primary);
+}
+
+.role-card.admin .role-icon {
+    background-color: #e0e7ff;
+    color: var(--admin);
+}
+
+.role-title {
+    font-size: 20px;
+    font-weight: 600;
+    margin-bottom: 10px;
+}
+
+.role-desc {
+    font-size: 14px;
+    color: var(--text-muted);
+    margin: 0 auto 24px;
+    max-width: 32ch;
+    line-height: 1.55;
+}
+
+.role-btn {
+    width: 100%;
+    padding: 13px 16px;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background-color 0.2s, box-shadow 0.2s;
+}
+
+.role-card.patient .role-btn {
+    background-color: var(--primary);
+    color: white;
+}
+
+.role-card.patient .role-btn:hover {
+    background-color: var(--primary-dark);
+}
+
+.role-card.admin .role-btn {
+    background-color: var(--admin);
+    color: white;
+}
+
+.role-card.admin .role-btn:hover {
+    background-color: var(--admin-dark);
+}
+
+.portal-footer {
+    text-align: center;
+    padding: 20px;
+    background-color: var(--page-bg);
+    font-size: 13px;
+    color: var(--text-muted);
+}
+
+.portal-footer a {
+    color: var(--primary);
+    text-decoration: none;
+    font-weight: 500;
+}
+
+.portal-footer a:hover {
+    text-decoration: underline;
+}
+
+@media (max-width: 480px) {
+    .portal-container {
+        border-radius: 16px;
+    }
+
+    .portal-header {
+        padding: 28px 20px 12px;
+    }
+
+    .role-selection {
+        padding: 12px 16px 20px;
+    }
+
+    .role-card {
+        min-height: 210px;
+        padding: 24px 18px 20px;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        scroll-behavior: auto !important;
+        transition-duration: 0.01ms !important;
+    }
+}
