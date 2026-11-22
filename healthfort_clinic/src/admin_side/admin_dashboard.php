@@ -1,3 +1,93 @@
+<?php
+  session_start();
+  header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+  header('Pragma: no-cache');
+  header('Expires: 0');
+  if (($_SESSION['user_role'] ?? '') !== 'admin') {
+    header('Location: ../login.php', true, 303);
+    exit;
+  }
+
+  require_once __DIR__ . '/../../db/conn.php';
+  require_once __DIR__ . '/../../db/patient_records_schema.php';
+  mysqli_report(MYSQLI_REPORT_OFF);
+  if (!ensurePatientRecordTables($conn)) {
+    http_response_code(500);
+    exit('Patient records are temporarily unavailable.');
+  }
+
+  $patientCountResult = mysqli_query($conn, 'SELECT COUNT(*) AS total FROM signup_tbl');
+  if ($patientCountResult === false) {
+    error_log('Admin dashboard patient count failed: ' . mysqli_error($conn));
+    http_response_code(500);
+    exit('Patient information is temporarily unavailable.');
+  }
+  $registeredPatientCount = (int) mysqli_fetch_assoc($patientCountResult)['total'];
+
+  $appointmentSummaryResult = mysqli_query(
+    $conn,
+    "SELECT COUNT(DISTINCT CASE WHEN status IN ('Waiting', 'Confirmed') THEN patient_email END) AS patients_with_appointments,
+            SUM(CASE WHEN appointment_date = CURDATE() AND status IN ('Waiting', 'Confirmed') THEN 1 ELSE 0 END) AS appointments_today,
+            SUM(CASE WHEN appointment_date >= CURDATE() AND status = 'Waiting' THEN 1 ELSE 0 END) AS pending_requests
+     FROM patient_appointments"
+  );
+  if ($appointmentSummaryResult === false) {
+    error_log('Admin dashboard appointment summary failed: ' . mysqli_error($conn));
+    http_response_code(500);
+    exit('Appointment information is temporarily unavailable.');
+  }
+  $appointmentSummary = mysqli_fetch_assoc($appointmentSummaryResult);
+  $patientsWithAppointments = (int) $appointmentSummary['patients_with_appointments'];
+  $appointmentsToday = (int) $appointmentSummary['appointments_today'];
+  $pendingRequests = (int) $appointmentSummary['pending_requests'];
+
+  $recentPatientsResult = mysqli_query(
+    $conn,
+    "SELECT s.firstname, s.surname,
+            COALESCE(a.appointment_count, 0) AS appointment_count,
+            COALESCE(v.visit_count, 0) AS visit_count,
+            p.patient_email IS NOT NULL AS has_profile,
+            GREATEST(
+              COALESCE(a.last_activity, '1000-01-01 00:00:00'),
+              COALESCE(v.last_activity, '1000-01-01 00:00:00'),
+              COALESCE(p.updated_at, '1000-01-01 00:00:00')
+            ) AS last_activity
+     FROM signup_tbl s
+     LEFT JOIN (
+       SELECT patient_email, COUNT(*) AS appointment_count, MAX(created_at) AS last_activity
+       FROM patient_appointments GROUP BY patient_email
+     ) a ON a.patient_email = s.email
+     LEFT JOIN (
+       SELECT patient_email, COUNT(*) AS visit_count, MAX(created_at) AS last_activity
+       FROM patient_prenatal_visits GROUP BY patient_email
+     ) v ON v.patient_email = s.email
+     LEFT JOIN patient_pregnancy_profiles p ON p.patient_email = s.email
+     ORDER BY last_activity DESC, s.surname, s.firstname
+     LIMIT 5"
+  );
+  if ($recentPatientsResult === false) {
+    error_log('Admin dashboard recent patients query failed: ' . mysqli_error($conn));
+    http_response_code(500);
+    exit('Patient information is temporarily unavailable.');
+  }
+
+  $todayAppointmentsResult = mysqli_query(
+    $conn,
+    "SELECT CONCAT_WS(' ', s.firstname, s.middlename, s.surname) AS patient_name,
+            a.service, TIME_FORMAT(a.appointment_time, '%l:%i %p') AS appointment_time,
+            a.status
+     FROM patient_appointments a
+     INNER JOIN signup_tbl s ON s.email = a.patient_email
+     WHERE a.appointment_date = CURDATE() AND a.status IN ('Waiting', 'Confirmed')
+     ORDER BY a.appointment_time
+     LIMIT 10"
+  );
+  if ($todayAppointmentsResult === false) {
+    error_log('Admin dashboard today appointments query failed: ' . mysqli_error($conn));
+    http_response_code(500);
+    exit('Appointment information is temporarily unavailable.');
+  }
+?>
 <!DOCTYPE html>
 <html lang="en">
 
@@ -101,76 +191,69 @@
 
         <section class="stats">
           <article class="stat-card">
+            <p class="stat-label">Registered patient accounts</p>
+            <p class="stat-value"><?php echo $registeredPatientCount; ?></p>
+            <p class="stat-note">All patient sign-ups</p>
+          </article>
+          <article class="stat-card">
+            <p class="stat-label">Patients with appointments</p>
+            <p class="stat-value"><?php echo $patientsWithAppointments; ?></p>
+            <p class="stat-note">Waiting or confirmed bookings</p>
+          </article>
+          <article class="stat-card">
             <p class="stat-label">Appointments today</p>
-            <p class="stat-value">18</p>
-            <p class="stat-note">+3 from yesterday</p>
+            <p class="stat-value"><?php echo $appointmentsToday; ?></p>
+            <p class="stat-note">Waiting or confirmed</p>
           </article>
           <article class="stat-card">
-            <p class="stat-label">Active prenatal patients</p>
-            <p class="stat-value">124</p>
-            <p class="stat-note">6 due this week</p>
-          </article>
-          <article class="stat-card">
-            <p class="stat-label">Deliveries this month</p>
-            <p class="stat-value">9</p>
-            <p class="stat-note">2 scheduled</p>
-          </article>
-          <article class="stat-card">
-            <p class="stat-label">Revenue this month</p>
-            <p class="stat-value">₱48,250</p>
-            <p class="stat-note">+12% from last month</p>
+            <p class="stat-label">Pending requests</p>
+            <p class="stat-value"><?php echo $pendingRequests; ?></p>
+            <p class="stat-note">Future appointments awaiting confirmation</p>
           </article>
         </section>
 
         <section class="grid-2">
           <article class="panel">
             <header class="panel-head">
-              <h3>Deliveries</h3>
-              <span class="muted">Last 6 months</span>
+              <h3>Client activity</h3>
+              <a href="admin_appointments.php">View appointments</a>
             </header>
-            <div class="bars" role="img" aria-label="Bar chart of deliveries per month">
-              <div class="bar-col">
-                <div class="bar" style="--h: 107px"></div><span>Jun</span>
-              </div>
-              <div class="bar-col">
-                <div class="bar" style="--h: 142px"></div><span>Jul</span>
-              </div>
-              <div class="bar-col">
-                <div class="bar" style="--h: 89px"></div><span>Aug</span>
-              </div>
-              <div class="bar-col">
-                <div class="bar" style="--h: 160px"></div><span>Sep</span>
-              </div>
-              <div class="bar-col">
-                <div class="bar" style="--h: 124px"></div><span>Oct</span>
-              </div>
-              <div class="bar-col">
-                <div class="bar" style="--h: 160px"></div><span>Nov</span>
-              </div>
-            </div>
+            <p class="stat-value"><?php echo $patientsWithAppointments; ?> patient account<?php echo $patientsWithAppointments === 1 ? '' : 's'; ?></p>
+            <p class="muted">have submitted at least one active appointment request.</p>
           </article>
 
           <article class="panel">
             <header class="panel-head">
               <h3>Recent patients</h3>
-              <a href="#">View all</a>
+              <a href="admin_patients.php">View all</a>
             </header>
             <ul class="patient-list">
-              <li>
-                <span class="avatar-sm">MS</span>
-                <div class="info"><strong>Maria Santos</strong><span>28 weeks · Prenatal</span></div>
-                <span class="muted">Nov 20</span>
-              </li>
-              <li>
-                <span class="avatar-sm">JR</span>
-                <div class="info"><strong>Jenna Reyes</strong><span>34 weeks · Prenatal</span></div>
-                <span class="muted">Nov 18</span>
-              </li>
-              <li>
-                <span class="avatar-sm">LM</span>
-                <div class="info"><strong>Liza Mendoza</strong><span>Postnatal · Week 2</span></div>
-                <span class="muted">Nov 24</span>
-              </li>
+              <?php if (mysqli_num_rows($recentPatientsResult) === 0): ?>
+                <li><div class="info"><strong>No registered patient accounts yet</strong></div></li>
+              <?php else: ?>
+                <?php while ($patient = mysqli_fetch_assoc($recentPatientsResult)): ?>
+                  <?php
+                    $patientName = trim($patient['firstname'] . ' ' . $patient['surname']);
+                    $initials = strtoupper(substr($patient['firstname'], 0, 1) . substr($patient['surname'], 0, 1));
+                    $activity = (int) $patient['appointment_count'] > 0
+                      ? (int) $patient['appointment_count'] . ' appointment request(s)'
+                      : ((int) $patient['visit_count'] > 0
+                        ? (int) $patient['visit_count'] . ' prenatal visit(s)'
+                        : ($patient['has_profile'] ? 'Prenatal profile on file' : 'Registered account'));
+                    $activityDate = $patient['last_activity'] === '1000-01-01 00:00:00'
+                      ? '—'
+                      : date('M j', strtotime($patient['last_activity']));
+                  ?>
+                  <li>
+                    <span class="avatar-sm"><?php echo htmlspecialchars($initials, ENT_QUOTES, 'UTF-8'); ?></span>
+                    <div class="info">
+                      <strong><?php echo htmlspecialchars($patientName, ENT_QUOTES, 'UTF-8'); ?></strong>
+                      <span><?php echo htmlspecialchars($activity, ENT_QUOTES, 'UTF-8'); ?></span>
+                    </div>
+                    <span class="muted"><?php echo htmlspecialchars($activityDate, ENT_QUOTES, 'UTF-8'); ?></span>
+                  </li>
+                <?php endwhile; ?>
+              <?php endif; ?>
             </ul>
           </article>
         </section>
@@ -178,7 +261,7 @@
         <section class="panel">
           <header class="panel-head">
             <h3>Today’s appointments</h3>
-            <a href="#">View all</a>
+            <a href="admin_appointments.php">View all</a>
           </header>
           <div class="table-wrap">
             <table>
@@ -191,36 +274,19 @@
                 </tr>
               </thead>
               <tbody>
-                <tr>
-                  <td>Maria Santos</td>
-                  <td>Prenatal check-up</td>
-                  <td>9:00 AM</td>
-                  <td><span class="pill pill-ok">Confirmed</span></td>
-                </tr>
-                <tr>
-                  <td>Jenna Reyes</td>
-                  <td>Ultrasound</td>
-                  <td>9:30 AM</td>
-                  <td><span class="pill pill-wait">Waiting</span></td>
-                </tr>
-                <tr>
-                  <td>Ana Cruz</td>
-                  <td>Normal delivery</td>
-                  <td>10:15 AM</td>
-                  <td><span class="pill pill-wait">In labor</span></td>
-                </tr>
-                <tr>
-                  <td>Paolo Dela Cruz</td>
-                  <td>Newborn care</td>
-                  <td>11:00 AM</td>
-                  <td><span class="pill pill-done">Completed</span></td>
-                </tr>
-                <tr>
-                  <td>Liza Mendoza</td>
-                  <td>Family planning</td>
-                  <td>1:30 PM</td>
-                  <td><span class="pill pill-ok">Confirmed</span></td>
-                </tr>
+                <?php if (mysqli_num_rows($todayAppointmentsResult) === 0): ?>
+                  <tr><td colspan="4" class="muted">No appointments are scheduled for today.</td></tr>
+                <?php else: ?>
+                  <?php while ($appointment = mysqli_fetch_assoc($todayAppointmentsResult)): ?>
+                    <?php $statusClass = $appointment['status'] === 'Confirmed' ? 'pill-ok' : 'pill-wait'; ?>
+                    <tr>
+                      <td><?php echo htmlspecialchars($appointment['patient_name'], ENT_QUOTES, 'UTF-8'); ?></td>
+                      <td><?php echo htmlspecialchars($appointment['service'], ENT_QUOTES, 'UTF-8'); ?></td>
+                      <td><?php echo htmlspecialchars($appointment['appointment_time'], ENT_QUOTES, 'UTF-8'); ?></td>
+                      <td><span class="pill <?php echo $statusClass; ?>"><?php echo htmlspecialchars($appointment['status'], ENT_QUOTES, 'UTF-8'); ?></span></td>
+                    </tr>
+                  <?php endwhile; ?>
+                <?php endif; ?>
               </tbody>
             </table>
           </div>
@@ -315,10 +381,15 @@
       if (!button) return;
       button.addEventListener("click", function () {
         if (window.confirm("Sign out of the Healthfort admin pages?")) {
-          window.location.href = "haven-lying-in-clinic.html";
+          window.location.href = "../logout.php";
         }
       });
     })();
+  </script>
+  <script>
+    window.addEventListener("pageshow", function (event) {
+      if (event.persisted) window.location.reload();
+    });
   </script>
 
 </body>

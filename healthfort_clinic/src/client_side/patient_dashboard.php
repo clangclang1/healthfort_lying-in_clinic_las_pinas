@@ -1,3 +1,149 @@
+<?php
+  session_start();
+  require_once __DIR__ . '/../../db/conn.php';
+  require_once __DIR__ . '/../../db/patient_records_schema.php';
+  mysqli_report(MYSQLI_REPORT_OFF);
+  header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+  header('Pragma: no-cache');
+  header('Expires: 0');
+  if (($_SESSION['user_role'] ?? '') !== 'patient' || empty($_SESSION['patient_email'])) {
+    header('Location: ../login.php', true, 303);
+    exit;
+  }
+
+  if (!ensurePatientRecordTables($conn)) {
+    http_response_code(500);
+    exit('Patient records are temporarily unavailable.');
+  }
+  $patientEmail = $_SESSION['patient_email'];
+  $patientLookup = mysqli_prepare($conn, 'SELECT firstname, middlename, surname FROM signup_tbl WHERE email = ? LIMIT 1');
+  if (!$patientLookup) {
+    error_log('Dashboard patient lookup preparation failed: ' . mysqli_error($conn));
+    http_response_code(500);
+    exit('Your patient information is temporarily unavailable.');
+  }
+  mysqli_stmt_bind_param($patientLookup, 's', $patientEmail);
+  if (!mysqli_stmt_execute($patientLookup)) {
+    error_log('Dashboard patient lookup failed: ' . mysqli_stmt_error($patientLookup));
+    mysqli_stmt_close($patientLookup);
+    http_response_code(500);
+    exit('Your patient information is temporarily unavailable.');
+  }
+  $patientResult = mysqli_stmt_get_result($patientLookup);
+  if ($patientResult === false) {
+    error_log('Dashboard patient result retrieval failed: ' . mysqli_stmt_error($patientLookup));
+    mysqli_stmt_close($patientLookup);
+    http_response_code(500);
+    exit('Your patient information is temporarily unavailable.');
+  }
+  $patientAccount = mysqli_fetch_assoc($patientResult);
+  mysqli_stmt_close($patientLookup);
+  if (!$patientAccount) {
+    header('Location: ../login.php', true, 303);
+    exit;
+  }
+  $patientName = trim($patientAccount['firstname'] . ' '
+    . ($patientAccount['middlename'] ? $patientAccount['middlename'] . ' ' : '')
+    . $patientAccount['surname']);
+
+  $profileQuery = mysqli_prepare(
+    $conn,
+    "SELECT DATE_FORMAT(estimated_due_date, '%Y-%m-%d') AS edd
+     FROM patient_pregnancy_profiles WHERE patient_email = ? LIMIT 1"
+  );
+  if (!$profileQuery) {
+    error_log('Dashboard pregnancy profile preparation failed: ' . mysqli_error($conn));
+    http_response_code(500);
+    exit('Pregnancy information is temporarily unavailable.');
+  }
+  mysqli_stmt_bind_param($profileQuery, 's', $patientEmail);
+  if (!mysqli_stmt_execute($profileQuery)) {
+    error_log('Dashboard pregnancy profile query failed: ' . mysqli_stmt_error($profileQuery));
+    mysqli_stmt_close($profileQuery);
+    http_response_code(500);
+    exit('Pregnancy information is temporarily unavailable.');
+  }
+  $profileResult = mysqli_stmt_get_result($profileQuery);
+  if ($profileResult === false) {
+    error_log('Dashboard pregnancy profile result retrieval failed: ' . mysqli_stmt_error($profileQuery));
+    mysqli_stmt_close($profileQuery);
+    http_response_code(500);
+    exit('Pregnancy information is temporarily unavailable.');
+  }
+  $pregnancyProfile = mysqli_fetch_assoc($profileResult);
+  mysqli_stmt_close($profileQuery);
+
+  $visits = [];
+  $visitsQuery = mysqli_prepare(
+    $conn,
+    "SELECT DATE_FORMAT(visit_date, '%Y-%m-%d') AS date, weeks,
+            blood_pressure AS bp, weight, fetal_heart_rate AS fhr, notes
+     FROM patient_prenatal_visits WHERE patient_email = ? ORDER BY visit_date"
+  );
+  if (!$visitsQuery) {
+    error_log('Dashboard prenatal visits preparation failed: ' . mysqli_error($conn));
+    http_response_code(500);
+    exit('Prenatal visits are temporarily unavailable.');
+  }
+  mysqli_stmt_bind_param($visitsQuery, 's', $patientEmail);
+  if (!mysqli_stmt_execute($visitsQuery)) {
+    error_log('Dashboard prenatal visits query failed: ' . mysqli_stmt_error($visitsQuery));
+    mysqli_stmt_close($visitsQuery);
+    http_response_code(500);
+    exit('Prenatal visits are temporarily unavailable.');
+  }
+  $visitsResult = mysqli_stmt_get_result($visitsQuery);
+  if ($visitsResult === false) {
+    error_log('Dashboard prenatal visits result retrieval failed: ' . mysqli_stmt_error($visitsQuery));
+    mysqli_stmt_close($visitsQuery);
+    http_response_code(500);
+    exit('Prenatal visits are temporarily unavailable.');
+  }
+  while ($visit = mysqli_fetch_assoc($visitsResult)) {
+    $visit['weeks'] = (int) $visit['weeks'];
+    $visit['weight'] = (float) $visit['weight'];
+    $visit['fhr'] = (int) $visit['fhr'];
+    $visit['notes'] = $visit['notes'] ?? '';
+    $visits[] = $visit;
+  }
+  mysqli_stmt_close($visitsQuery);
+
+  $appointments = [];
+  $appointmentsQuery = mysqli_prepare(
+    $conn,
+    "SELECT DATE_FORMAT(appointment_date, '%Y-%m-%d') AS date,
+            TIME_FORMAT(appointment_time, '%H:%i') AS slot,
+            service, doctor, status
+     FROM patient_appointments
+     WHERE patient_email = ? AND status IN ('Confirmed', 'Waiting')
+       AND appointment_date >= CURDATE()
+     ORDER BY appointment_date, appointment_time"
+  );
+  if (!$appointmentsQuery) {
+    error_log('Dashboard appointments preparation failed: ' . mysqli_error($conn));
+    http_response_code(500);
+    exit('Appointments are temporarily unavailable.');
+  }
+  mysqli_stmt_bind_param($appointmentsQuery, 's', $patientEmail);
+  if (!mysqli_stmt_execute($appointmentsQuery)) {
+    error_log('Dashboard appointments query failed: ' . mysqli_stmt_error($appointmentsQuery));
+    mysqli_stmt_close($appointmentsQuery);
+    http_response_code(500);
+    exit('Appointments are temporarily unavailable.');
+  }
+  $appointmentsResult = mysqli_stmt_get_result($appointmentsQuery);
+  if ($appointmentsResult === false) {
+    error_log('Dashboard appointments result retrieval failed: ' . mysqli_stmt_error($appointmentsQuery));
+    mysqli_stmt_close($appointmentsQuery);
+    http_response_code(500);
+    exit('Appointments are temporarily unavailable.');
+  }
+  while ($appointment = mysqli_fetch_assoc($appointmentsResult)) {
+    $appointment['time'] = date('g:i A', strtotime($appointment['slot']));
+    $appointments[] = $appointment;
+  }
+  mysqli_stmt_close($appointmentsQuery);
+?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -37,7 +183,7 @@
           </div>
         <time id="clock" class="clock" aria-live="off">--:--:--</time>
           <div class="quick-actions">
-            <div class="user-block"><span class="user-name">Maria Santos</span><span class="user-role">Patient</span></div>
+            <div class="user-block"><span class="user-name"><?php echo htmlspecialchars($patientName, ENT_QUOTES, 'UTF-8'); ?></span><span class="user-role">Patient</span></div>
             <button type="button" class="profile-btn" aria-label="Profile"><svg class="profile-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"/></svg></button>
           </div>
         </div>
@@ -57,7 +203,7 @@
           <article class="stat-card"><p class="stat-label">Weeks of pregnancy</p><p class="stat-value" id="p-weeks">0</p><p class="stat-note" id="p-weeks-note"></p></article>
           <article class="stat-card"><p class="stat-label">Days until due date</p><p class="stat-value" id="p-days">0</p><p class="stat-note" id="p-edd"></p></article>
           <article class="stat-card"><p class="stat-label">Upcoming visits</p><p class="stat-value" id="p-upcoming">0</p><p class="stat-note">Scheduled with Healthfort</p></article>
-          <article class="stat-card"><p class="stat-label">Completed visits</p><p class="stat-value" id="p-completed">0</p><p class="stat-note">Since your first check-up</p></article>
+          <article class="stat-card"><p class="stat-label">Visits recorded</p><p class="stat-value" id="p-completed">0</p><p class="stat-note">From your prenatal history</p></article>
         </section>
 
         <section class="split-layout">
@@ -65,7 +211,7 @@
             <header class="panel-head"><h3>Next appointment</h3></header>
             <dl class="detail-list" id="next-list"></dl>
             <p class="next-empty" id="next-empty" hidden>You have no upcoming visit. Book one to continue your care.</p>
-            <a href="healthfort-patient-appointments.html" class="btn-primary-sm">Book a visit</a>
+            <a href="patient_appointments.php" class="btn-primary-sm">Book a visit</a>
           </article>
 
           <article class="panel">
@@ -96,8 +242,6 @@
           </article>
         </section>
 
-
-        <p class="sample-note">Sample data for layout purposes only.</p>
       </main>
     </div>
   </div>
@@ -185,7 +329,7 @@
       if (!button) return;
       button.addEventListener("click", function () {
         if (window.confirm("Sign out of your Healthfort account?")) {
-          window.location.href = "haven-lying-in-clinic.html";
+          window.location.href = "../logout.php";
         }
       });
     })();
@@ -195,19 +339,9 @@
       var DAY = 86400000;
       var today = new Date();
       today.setHours(0, 0, 0, 0);
-      var EDD = "2027-02-09";
-
-      var APPTS = [
-        { date: "2026-11-20", time: "9:00 AM", service: "Prenatal check-up", doctor: "Dr. Ana Villareal", status: "Confirmed" },
-        { date: "2026-10-19", time: "9:30 AM", service: "Prenatal check-up", doctor: "Dr. Ana Villareal", status: "Completed" },
-        { date: "2026-09-21", time: "10:00 AM", service: "Ultrasound and scans", doctor: "Dr. Ana Villareal", status: "Completed" },
-        { date: "2026-08-10", time: "9:15 AM", service: "Prenatal check-up", doctor: "Dr. Ana Villareal", status: "Completed" }
-      ];
-      var VISITS = [
-        { date: "2026-08-10", weeks: 14, bp: "108/68", weight: 56.4, fhr: 152, notes: "Routine check. Labs ordered." },
-        { date: "2026-09-21", weeks: 20, bp: "110/70", weight: 58.2, fhr: 148, notes: "Anatomy scan scheduled." },
-        { date: "2026-10-19", weeks: 24, bp: "112/72", weight: 60.1, fhr: 146, notes: "Glucose screening ordered." }
-      ];
+      var EDD = <?php echo json_encode($pregnancyProfile['edd'] ?? null, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
+      var APPTS = <?php echo json_encode($appointments, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
+      var VISITS = <?php echo json_encode($visits, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
       var MILESTONES = [
         { label: "Anatomy scan", from: 18, to: 22 },
         { label: "Glucose screening", from: 24, to: 28 },
@@ -227,17 +361,17 @@
         document.getElementById(id).textContent = text;
       }
 
-      var daysToDue = Math.round((parse(EDD) - today) / DAY);
-      var weeks = 40 - Math.round(daysToDue / 7);
+      var daysToDue = EDD ? Math.round((parse(EDD) - today) / DAY) : null;
+      var weeks = daysToDue === null ? null : 40 - Math.round(daysToDue / 7);
       var upcomingList = APPTS.filter(function (a) {
         return (a.status === "Confirmed" || a.status === "Waiting") && parse(a.date) >= today;
       }).sort(function (a, b) { return a.date < b.date ? -1 : 1; });
-      var completed = APPTS.filter(function (a) { return a.status === "Completed"; }).length;
+      var completed = VISITS.length;
 
-      set("p-weeks", weeks);
-      set("p-weeks-note", "of 40 weeks");
-      set("p-days", daysToDue);
-      set("p-edd", "Due " + fmt(EDD));
+      set("p-weeks", weeks === null ? "—" : weeks);
+      set("p-weeks-note", weeks === null ? "Pregnancy profile not set" : "of 40 weeks");
+      set("p-days", daysToDue === null ? "—" : daysToDue);
+      set("p-edd", EDD ? "Due " + fmt(EDD) : "Due date not set");
       set("p-upcoming", upcomingList.length);
       set("p-completed", completed);
 
@@ -259,45 +393,61 @@
         document.getElementById("next-empty").hidden = false;
       }
 
-      var pct = Math.min(100, Math.round((weeks / 40) * 100));
+      var pct = weeks === null ? 0 : Math.min(100, Math.max(0, Math.round((weeks / 40) * 100)));
       document.getElementById("p-progress").style.width = pct + "%";
-      set("p-progress-label", "Week " + weeks + " of 40");
+      set("p-progress-label", weeks === null ? "Pregnancy profile not set" : "Week " + weeks + " of 40");
 
       var ms = document.getElementById("milestones");
-      MILESTONES.forEach(function (m) {
-        var status = weeks > m.to ? "Done" : (weeks >= m.from ? "This period" : "Upcoming");
-        var li = document.createElement("li");
-        var left = document.createElement("span");
-        var name = document.createElement("strong");
-        name.textContent = m.label;
-        var range = document.createElement("small");
-        range.textContent = "Weeks " + m.from + " to " + m.to;
-        left.appendChild(name);
-        left.appendChild(range);
-        var pill = document.createElement("span");
-        pill.className = "pill " + PILL[status];
-        pill.textContent = status;
-        li.appendChild(left);
-        li.appendChild(pill);
-        ms.appendChild(li);
-      });
+      if (weeks === null) {
+        var noProfile = document.createElement("li");
+        noProfile.textContent = "Your care team has not added a pregnancy profile yet.";
+        ms.appendChild(noProfile);
+      } else {
+        MILESTONES.forEach(function (m) {
+          var status = weeks > m.to ? "Done" : (weeks >= m.from ? "This period" : "Upcoming");
+          var li = document.createElement("li");
+          var left = document.createElement("span");
+          var name = document.createElement("strong");
+          name.textContent = m.label;
+          var range = document.createElement("small");
+          range.textContent = "Weeks " + m.from + " to " + m.to;
+          left.appendChild(name);
+          left.appendChild(range);
+          var pill = document.createElement("span");
+          pill.className = "pill " + PILL[status];
+          pill.textContent = status;
+          li.appendChild(left);
+          li.appendChild(pill);
+          ms.appendChild(li);
+        });
+      }
 
       var last = VISITS.slice().sort(function (a, b) { return a.date < b.date ? 1 : -1; })[0];
-      set("latest-date", fmt(last.date));
       var latestList = document.getElementById("latest-list");
-      [["Weeks of pregnancy", String(last.weeks)], ["Blood pressure", last.bp],
-       ["Weight", last.weight.toFixed(1) + " kg"], ["Fetal heart rate", last.fhr + " bpm"]].forEach(function (row) {
-        var div = document.createElement("div");
-        var dt = document.createElement("dt");
-        dt.textContent = row[0];
-        var dd = document.createElement("dd");
-        dd.textContent = row[1];
-        div.appendChild(dt);
-        div.appendChild(dd);
-        latestList.appendChild(div);
-      });
-      set("latest-notes", last.notes);
+      if (last) {
+        set("latest-date", fmt(last.date));
+        [["Weeks of pregnancy", String(last.weeks)], ["Blood pressure", last.bp],
+         ["Weight", Number(last.weight).toFixed(1) + " kg"], ["Fetal heart rate", last.fhr + " bpm"]].forEach(function (row) {
+          var div = document.createElement("div");
+          var dt = document.createElement("dt");
+          dt.textContent = row[0];
+          var dd = document.createElement("dd");
+          dd.textContent = row[1];
+          div.appendChild(dt);
+          div.appendChild(dd);
+          latestList.appendChild(div);
+        });
+        set("latest-notes", last.notes || "No visit notes.");
+      } else {
+        set("latest-date", "No visits");
+        set("latest-notes", "No prenatal visits have been recorded yet.");
+      }
     })();
+  </script>
+  <script>
+    window.addEventListener("pageshow", function (event) {
+      if (event.persisted) window.location.reload();
+    });
   </script>
 
 </body>

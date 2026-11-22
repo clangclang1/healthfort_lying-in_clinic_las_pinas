@@ -1,3 +1,90 @@
+<?php
+  session_start();
+  header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+  header('Pragma: no-cache');
+  header('Expires: 0');
+  if (($_SESSION['user_role'] ?? '') !== 'admin') {
+    header('Location: ../login.php', true, 303);
+    exit;
+  }
+
+  require_once __DIR__ . '/../../db/conn.php';
+  require_once __DIR__ . '/../../db/patient_records_schema.php';
+  mysqli_report(MYSQLI_REPORT_OFF);
+  if (!ensurePatientRecordTables($conn)) {
+    http_response_code(500);
+    exit('Appointments are temporarily unavailable.');
+  }
+
+  if (empty($_SESSION['admin_appointments_csrf'])) {
+    $_SESSION['admin_appointments_csrf'] = bin2hex(random_bytes(32));
+  }
+
+  function adminAppointmentResponse($status, $message, $data = []) {
+    http_response_code($status);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(array_merge(['message' => $message], $data));
+    exit;
+  }
+
+  if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
+    $csrf = $_POST['csrf'] ?? '';
+    $appointmentId = filter_var($_POST['id'] ?? '', FILTER_VALIDATE_INT);
+    $currentStatus = is_string($_POST['current_status'] ?? null) ? $_POST['current_status'] : '';
+    $newStatus = is_string($_POST['status'] ?? null) ? $_POST['status'] : '';
+    $transitions = [
+      'Waiting' => ['Confirmed', 'Cancelled'],
+      'Confirmed' => ['Completed', 'Cancelled'],
+      'Cancelled' => ['Confirmed']
+    ];
+
+    if (!is_string($csrf) || !hash_equals($_SESSION['admin_appointments_csrf'], $csrf)) {
+      adminAppointmentResponse(403, 'Your session expired. Refresh the page and try again.');
+    }
+    if (!$appointmentId || $appointmentId < 1
+      || !isset($transitions[$currentStatus])
+      || !in_array($newStatus, $transitions[$currentStatus], true)) {
+      adminAppointmentResponse(422, 'Choose a valid appointment status change.');
+    }
+
+    $update = mysqli_prepare(
+      $conn,
+      'UPDATE patient_appointments SET status = ? WHERE id = ? AND status = ?'
+    );
+    if (!$update) {
+      error_log('Admin appointment update preparation failed: ' . mysqli_error($conn));
+      adminAppointmentResponse(500, 'We could not update this appointment.');
+    }
+    mysqli_stmt_bind_param($update, 'sis', $newStatus, $appointmentId, $currentStatus);
+    if (!mysqli_stmt_execute($update)) {
+      error_log('Admin appointment update failed: ' . mysqli_stmt_error($update));
+      mysqli_stmt_close($update);
+      adminAppointmentResponse(500, 'We could not update this appointment.');
+    }
+    $updated = mysqli_stmt_affected_rows($update) === 1;
+    mysqli_stmt_close($update);
+    if (!$updated) {
+      adminAppointmentResponse(409, 'This appointment has changed. Refresh and try again.');
+    }
+    adminAppointmentResponse(200, 'Appointment updated.', ['status' => $newStatus]);
+  }
+
+  $appointmentsResult = mysqli_query(
+    $conn,
+    "SELECT a.id, a.patient_email, CONCAT_WS(' ', s.firstname, s.middlename, s.surname) AS patient_name,
+            s.phone, a.service, DATE_FORMAT(a.appointment_date, '%Y-%m-%d') AS appointment_date,
+            DATE_FORMAT(a.appointment_date, '%b %e, %Y') AS display_date,
+            TIME_FORMAT(a.appointment_time, '%l:%i %p') AS display_time, a.status
+     FROM patient_appointments a
+     INNER JOIN signup_tbl s ON s.email = a.patient_email
+     ORDER BY a.appointment_date DESC, a.appointment_time DESC"
+  );
+  if ($appointmentsResult === false) {
+    error_log('Admin appointments list query failed: ' . mysqli_error($conn));
+    http_response_code(500);
+    exit('Appointment information is temporarily unavailable.');
+  }
+?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -126,14 +213,26 @@
                 </tr>
               </thead>
               <tbody id="rows">
-                <tr data-name="Maria Santos" data-status="Confirmed" data-service="Prenatal check-up" data-date="2026-11-16"><td>Maria Santos</td><td>0917 555 0142</td><td>Prenatal check-up</td><td>Nov 16, 2026</td><td>9:00 AM</td><td><span class="pill"></span></td><td class="actions"></td></tr>
-                <tr data-name="Jenna Reyes" data-status="Waiting" data-service="Ultrasound and scans" data-date="2026-11-16"><td>Jenna Reyes</td><td>0918 555 0236</td><td>Ultrasound and scans</td><td>Nov 16, 2026</td><td>9:30 AM</td><td><span class="pill"></span></td><td class="actions"></td></tr>
-                <tr data-name="Ana Cruz" data-status="Confirmed" data-service="Normal delivery" data-date="2026-11-16"><td>Ana Cruz</td><td>0919 555 0318</td><td>Normal delivery</td><td>Nov 16, 2026</td><td>10:15 AM</td><td><span class="pill"></span></td><td class="actions"></td></tr>
-                <tr data-name="Paolo Dela Cruz" data-status="Completed" data-service="Newborn care" data-date="2026-11-16"><td>Paolo Dela Cruz</td><td>0920 555 0471</td><td>Newborn care</td><td>Nov 16, 2026</td><td>11:00 AM</td><td><span class="pill"></span></td><td class="actions"></td></tr>
-                <tr data-name="Liza Mendoza" data-status="Confirmed" data-service="Family planning" data-date="2026-11-16"><td>Liza Mendoza</td><td>0921 555 0592</td><td>Family planning</td><td>Nov 16, 2026</td><td>1:30 PM</td><td><span class="pill"></span></td><td class="actions"></td></tr>
-                <tr data-name="Carla Ramos" data-status="Waiting" data-service="Prenatal check-up" data-date="2026-11-17"><td>Carla Ramos</td><td>0922 555 0609</td><td>Prenatal check-up</td><td>Nov 17, 2026</td><td>8:30 AM</td><td><span class="pill"></span></td><td class="actions"></td></tr>
-                <tr data-name="Grace Villanueva" data-status="Confirmed" data-service="Postnatal care" data-date="2026-11-17"><td>Grace Villanueva</td><td>0923 555 0713</td><td>Postnatal care</td><td>Nov 17, 2026</td><td>10:00 AM</td><td><span class="pill"></span></td><td class="actions"></td></tr>
-                <tr data-name="Irene Bautista" data-status="Cancelled" data-service="Ultrasound and scans" data-date="2026-11-18"><td>Irene Bautista</td><td>0924 555 0826</td><td>Ultrasound and scans</td><td>Nov 18, 2026</td><td>2:00 PM</td><td><span class="pill"></span></td><td class="actions"></td></tr>
+                <?php if (mysqli_num_rows($appointmentsResult) === 0): ?>
+                  <tr><td colspan="7">No patient appointment requests have been made yet.</td></tr>
+                <?php else: ?>
+                  <?php while ($appointment = mysqli_fetch_assoc($appointmentsResult)): ?>
+                    <tr
+                      data-id="<?php echo (int) $appointment['id']; ?>"
+                      data-name="<?php echo htmlspecialchars($appointment['patient_name'], ENT_QUOTES, 'UTF-8'); ?>"
+                      data-status="<?php echo htmlspecialchars($appointment['status'], ENT_QUOTES, 'UTF-8'); ?>"
+                      data-service="<?php echo htmlspecialchars($appointment['service'], ENT_QUOTES, 'UTF-8'); ?>"
+                      data-date="<?php echo htmlspecialchars($appointment['appointment_date'], ENT_QUOTES, 'UTF-8'); ?>">
+                      <td><?php echo htmlspecialchars($appointment['patient_name'], ENT_QUOTES, 'UTF-8'); ?></td>
+                      <td><?php echo htmlspecialchars($appointment['phone'], ENT_QUOTES, 'UTF-8'); ?></td>
+                      <td><?php echo htmlspecialchars($appointment['service'], ENT_QUOTES, 'UTF-8'); ?></td>
+                      <td><?php echo htmlspecialchars($appointment['display_date'], ENT_QUOTES, 'UTF-8'); ?></td>
+                      <td><?php echo htmlspecialchars($appointment['display_time'], ENT_QUOTES, 'UTF-8'); ?></td>
+                      <td><span class="pill"></span></td>
+                      <td class="actions"></td>
+                    </tr>
+                  <?php endwhile; ?>
+                <?php endif; ?>
               </tbody>
             </table>
           </div>
@@ -226,7 +325,7 @@
   </script>
   <script>
     (function () {
-      var rows = Array.prototype.slice.call(document.querySelectorAll("#rows tr"));
+      var rows = Array.prototype.slice.call(document.querySelectorAll("#rows tr[data-status]"));
       var search = document.getElementById("search");
       var fStatus = document.getElementById("filter-status");
       var fService = document.getElementById("filter-service");
@@ -234,6 +333,7 @@
       var clear = document.getElementById("clear-filters");
       var count = document.getElementById("count");
       var tbody = document.getElementById("rows");
+      var csrf = <?php echo json_encode($_SESSION['admin_appointments_csrf']); ?>;
 
       var PILL = { Confirmed: "pill-ok", Waiting: "pill-wait", Completed: "pill-done", Cancelled: "pill-cancel" };
       var NEXT = { confirm: "Confirmed", complete: "Completed", cancel: "Cancelled" };
@@ -297,9 +397,31 @@
         var btn = e.target.closest("button[data-action]");
         if (!btn) return;
         var tr = btn.closest("tr");
-        tr.setAttribute("data-status", NEXT[btn.getAttribute("data-action")]);
-        renderRow(tr);
-        apply();
+        var currentStatus = tr.getAttribute("data-status");
+        var newStatus = NEXT[btn.getAttribute("data-action")];
+        btn.disabled = true;
+        fetch(window.location.href, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
+          body: new URLSearchParams({
+            csrf: csrf,
+            id: tr.getAttribute("data-id"),
+            current_status: currentStatus,
+            status: newStatus
+          })
+        }).then(function (response) {
+          return response.json().then(function (data) {
+            if (!response.ok) throw new Error(data.message || "We could not update this appointment.");
+            return data;
+          });
+        }).then(function (data) {
+          tr.setAttribute("data-status", data.status);
+          renderRow(tr);
+          apply();
+        }).catch(function (error) {
+          window.alert(error.message || "We could not update this appointment.");
+          btn.disabled = false;
+        });
       });
 
       search.addEventListener("input", apply);
@@ -476,11 +598,16 @@
       if (!button) return;
       button.addEventListener("click", function () {
         if (window.confirm("Sign out of the Healthfort admin pages?")) {
-          window.location.href = "haven-lying-in-clinic.html";
+          window.location.href = "../logout.php";
         }
       });
     })();
   </script>
 
+  <script>
+    window.addEventListener("pageshow", function (event) {
+      if (event.persisted) window.location.reload();
+    });
+  </script>
 </body>
 </html>

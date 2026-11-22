@@ -1,3 +1,262 @@
+<?php
+  session_start();
+  require_once __DIR__ . '/../../db/conn.php';
+  require_once __DIR__ . '/../../db/patient_records_schema.php';
+  mysqli_report(MYSQLI_REPORT_OFF);
+  header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+  header('Pragma: no-cache');
+  header('Expires: 0');
+  if (($_SESSION['user_role'] ?? '') !== 'admin') {
+    header('Location: ../login.php', true, 303);
+    exit;
+  }
+
+  if (!ensurePatientRecordTables($conn)) {
+    http_response_code(500);
+    exit('Patient records are temporarily unavailable.');
+  }
+
+  if (empty($_SESSION['patient_records_csrf'])) {
+    $_SESSION['patient_records_csrf'] = bin2hex(random_bytes(32));
+  }
+
+  function patientRecordsResponse($status, $message, $data = []) {
+    http_response_code($status);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(array_merge(['message' => $message], $data));
+    exit;
+  }
+
+  if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
+    $csrf = $_POST['csrf'] ?? '';
+    if (!is_string($csrf) || !hash_equals($_SESSION['patient_records_csrf'], $csrf)) {
+      patientRecordsResponse(403, 'Your session expired. Refresh the page and try again.');
+    }
+
+    $action = $_POST['action'] ?? '';
+    $patientEmail = is_string($_POST['patient_email'] ?? null) ? trim($_POST['patient_email']) : '';
+    if (!filter_var($patientEmail, FILTER_VALIDATE_EMAIL)) {
+      patientRecordsResponse(422, 'Select a valid patient account.');
+    }
+    $patientCheck = mysqli_prepare($conn, 'SELECT email FROM signup_tbl WHERE email = ? LIMIT 1');
+    if (!$patientCheck) {
+      error_log('Patient record account check preparation failed: ' . mysqli_error($conn));
+      patientRecordsResponse(500, 'We could not verify this patient account.');
+    }
+    mysqli_stmt_bind_param($patientCheck, 's', $patientEmail);
+    if (!mysqli_stmt_execute($patientCheck)) {
+      error_log('Patient record account check failed: ' . mysqli_stmt_error($patientCheck));
+      mysqli_stmt_close($patientCheck);
+      patientRecordsResponse(500, 'We could not verify this patient account.');
+    }
+    $patientResult = mysqli_stmt_get_result($patientCheck);
+    if ($patientResult === false) {
+      error_log('Patient record account result retrieval failed: ' . mysqli_stmt_error($patientCheck));
+      mysqli_stmt_close($patientCheck);
+      patientRecordsResponse(500, 'We could not verify this patient account.');
+    }
+    $patientExists = mysqli_num_rows($patientResult) === 1;
+    mysqli_stmt_close($patientCheck);
+    if (!$patientExists) {
+      patientRecordsResponse(404, 'The selected patient account was not found.');
+    }
+
+    if ($action === 'profile') {
+      $eddInput = is_string($_POST['edd'] ?? null) ? trim($_POST['edd']) : '';
+      $nextInput = is_string($_POST['next_visit'] ?? null) ? trim($_POST['next_visit']) : '';
+      $provider = is_string($_POST['doctor'] ?? null) ? trim($_POST['doctor']) : '';
+      $followUpInput = is_string($_POST['follow_up'] ?? null) ? $_POST['follow_up'] : '0';
+      $providers = ['Dr. Ana Villareal', 'Dr. Mark Reyes', 'Rosa Lim', 'Carla Dizon'];
+      $edd = DateTime::createFromFormat('!Y-m-d', $eddInput);
+      $nextVisit = $nextInput === '' ? null : DateTime::createFromFormat('!Y-m-d', $nextInput);
+      if (!$edd || $edd->format('Y-m-d') !== $eddInput
+        || ($nextInput !== '' && (!$nextVisit || $nextVisit->format('Y-m-d') !== $nextInput
+          || $nextVisit < new DateTime('today')))
+        || !in_array($provider, $providers, true) || !in_array((string) $followUpInput, ['0', '1'], true)) {
+        patientRecordsResponse(422, 'Enter a valid due date, next visit, provider, and follow-up status.');
+      }
+
+      $nextVisitValue = $nextVisit ? $nextVisit->format('Y-m-d') : null;
+      $followUp = (int) $followUpInput;
+      $saveProfile = mysqli_prepare(
+        $conn,
+        'INSERT INTO patient_pregnancy_profiles
+          (patient_email, estimated_due_date, next_visit, assigned_provider, follow_up_required)
+         VALUES (?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE estimated_due_date = VALUES(estimated_due_date),
+           next_visit = VALUES(next_visit), assigned_provider = VALUES(assigned_provider),
+           follow_up_required = VALUES(follow_up_required)'
+      );
+      if (!$saveProfile) {
+        error_log('Patient pregnancy profile preparation failed: ' . mysqli_error($conn));
+        patientRecordsResponse(500, 'We could not save the pregnancy profile.');
+      }
+      mysqli_stmt_bind_param(
+        $saveProfile,
+        'ssssi',
+        $patientEmail,
+        $eddInput,
+        $nextVisitValue,
+        $provider,
+        $followUp
+      );
+      if (!mysqli_stmt_execute($saveProfile)) {
+        error_log('Patient pregnancy profile save failed: ' . mysqli_stmt_error($saveProfile));
+        mysqli_stmt_close($saveProfile);
+        patientRecordsResponse(500, 'We could not save the pregnancy profile.');
+      }
+      mysqli_stmt_close($saveProfile);
+      patientRecordsResponse(200, 'Pregnancy profile saved.', [
+        'profile' => [
+          'edd' => $eddInput,
+          'next' => $nextVisitValue,
+          'doctor' => $provider,
+          'flag' => $followUp === 1
+        ]
+      ]);
+    }
+
+    if ($action === 'visit') {
+      $dateInput = is_string($_POST['date'] ?? null) ? trim($_POST['date']) : '';
+      $weeksInput = filter_var($_POST['weeks'] ?? null, FILTER_VALIDATE_INT);
+      $bp = is_string($_POST['bp'] ?? null) ? trim($_POST['bp']) : '';
+      $weightInput = is_string($_POST['weight'] ?? null) ? trim($_POST['weight']) : '';
+      $fhrInput = filter_var($_POST['fhr'] ?? null, FILTER_VALIDATE_INT);
+      $notes = is_string($_POST['notes'] ?? null) ? trim($_POST['notes']) : '';
+      $visitDate = DateTime::createFromFormat('!Y-m-d', $dateInput);
+      if (!$visitDate || $visitDate->format('Y-m-d') !== $dateInput
+        || $visitDate > new DateTime('today')
+        || $weeksInput === false || $weeksInput < 4 || $weeksInput > 42
+        || !preg_match('/^[0-9]{2,3}\/[0-9]{2,3}$/', $bp)
+        || !is_numeric($weightInput) || (float) $weightInput < 30 || (float) $weightInput > 150
+        || $fhrInput === false || $fhrInput < 90 || $fhrInput > 200
+        || strlen($notes) > 2000) {
+        patientRecordsResponse(422, 'Enter valid visit date and measurements.');
+      }
+
+      $profileCheck = mysqli_prepare($conn, 'SELECT patient_email FROM patient_pregnancy_profiles WHERE patient_email = ? LIMIT 1');
+      if (!$profileCheck) {
+        error_log('Patient pregnancy profile check preparation failed: ' . mysqli_error($conn));
+        patientRecordsResponse(500, 'We could not verify the pregnancy profile.');
+      }
+      mysqli_stmt_bind_param($profileCheck, 's', $patientEmail);
+      if (!mysqli_stmt_execute($profileCheck)) {
+        error_log('Patient pregnancy profile check failed: ' . mysqli_stmt_error($profileCheck));
+        mysqli_stmt_close($profileCheck);
+        patientRecordsResponse(500, 'We could not verify the pregnancy profile.');
+      }
+      $profileResult = mysqli_stmt_get_result($profileCheck);
+      if ($profileResult === false) {
+        error_log('Patient pregnancy profile result retrieval failed: ' . mysqli_stmt_error($profileCheck));
+        mysqli_stmt_close($profileCheck);
+        patientRecordsResponse(500, 'We could not verify the pregnancy profile.');
+      }
+      $hasProfile = mysqli_num_rows($profileResult) === 1;
+      mysqli_stmt_close($profileCheck);
+      if (!$hasProfile) {
+        patientRecordsResponse(409, 'Save this patient’s pregnancy profile before recording a visit.');
+      }
+
+      $weight = (float) $weightInput;
+      $fhr = (int) $fhrInput;
+      $notesForDatabase = $notes === '' ? null : $notes;
+      $saveVisit = mysqli_prepare(
+        $conn,
+        'INSERT INTO patient_prenatal_visits
+          (patient_email, visit_date, weeks, blood_pressure, weight, fetal_heart_rate, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?)'
+      );
+      if (!$saveVisit) {
+        error_log('Patient prenatal visit preparation failed: ' . mysqli_error($conn));
+        patientRecordsResponse(500, 'We could not save the visit record.');
+      }
+      mysqli_stmt_bind_param(
+        $saveVisit,
+        'ssisdis',
+        $patientEmail,
+        $dateInput,
+        $weeksInput,
+        $bp,
+        $weight,
+        $fhr,
+        $notesForDatabase
+      );
+      if (!mysqli_stmt_execute($saveVisit)) {
+        error_log('Patient prenatal visit save failed: ' . mysqli_stmt_error($saveVisit));
+        mysqli_stmt_close($saveVisit);
+        patientRecordsResponse(500, 'We could not save the visit record.');
+      }
+      $visit = [
+        'id' => mysqli_insert_id($conn),
+        'date' => $dateInput,
+        'weeks' => (int) $weeksInput,
+        'bp' => $bp,
+        'weight' => $weight,
+        'fhr' => $fhr,
+        'notes' => $notes
+      ];
+      mysqli_stmt_close($saveVisit);
+      patientRecordsResponse(201, 'Visit saved for this patient.', ['visit' => $visit]);
+    }
+
+    patientRecordsResponse(400, 'Choose a valid patient-record action.');
+  }
+
+  $patients = [];
+  $patientsByEmail = [];
+  $patientsQuery = mysqli_query(
+    $conn,
+    "SELECT s.firstname, s.middlename, s.surname, s.email, s.phone,
+            DATE_FORMAT(p.estimated_due_date, '%Y-%m-%d') AS edd,
+            DATE_FORMAT(p.next_visit, '%Y-%m-%d') AS next_visit,
+            p.assigned_provider, p.follow_up_required
+     FROM signup_tbl s
+     LEFT JOIN patient_pregnancy_profiles p ON p.patient_email = s.email
+     ORDER BY s.surname, s.firstname"
+  );
+  if (!$patientsQuery) {
+    error_log('Admin patient list query failed: ' . mysqli_error($conn));
+    http_response_code(500);
+    exit('Patient records are temporarily unavailable.');
+  }
+  while ($row = mysqli_fetch_assoc($patientsQuery)) {
+    $row['name'] = trim($row['firstname'] . ' ' . ($row['middlename'] ? $row['middlename'] . ' ' : '') . $row['surname']);
+    $row['flag'] = (bool) $row['follow_up_required'];
+    $row['doctor'] = $row['assigned_provider'] ?? '';
+    $row['next'] = $row['next_visit'];
+    $row['visits'] = [];
+    unset($row['firstname'], $row['middlename'], $row['surname'], $row['assigned_provider'], $row['follow_up_required'], $row['next_visit']);
+    $patientsByEmail[$row['email']] = count($patients);
+    $patients[] = $row;
+  }
+
+  $visitsQuery = mysqli_query(
+    $conn,
+    "SELECT id, patient_email, DATE_FORMAT(visit_date, '%Y-%m-%d') AS date,
+            weeks, blood_pressure AS bp, weight, fetal_heart_rate AS fhr, notes
+     FROM patient_prenatal_visits ORDER BY visit_date"
+  );
+  if (!$visitsQuery) {
+    error_log('Admin prenatal visits query failed: ' . mysqli_error($conn));
+    http_response_code(500);
+    exit('Patient records are temporarily unavailable.');
+  }
+  while ($visitRow = mysqli_fetch_assoc($visitsQuery)) {
+    if (!isset($patientsByEmail[$visitRow['patient_email']])) {
+      continue;
+    }
+    $patientIndex = $patientsByEmail[$visitRow['patient_email']];
+    $patients[$patientIndex]['visits'][] = [
+      'id' => (int) $visitRow['id'],
+      'date' => $visitRow['date'],
+      'weeks' => (int) $visitRow['weeks'],
+      'bp' => $visitRow['bp'],
+      'weight' => (float) $visitRow['weight'],
+      'fhr' => (int) $visitRow['fhr'],
+      'notes' => $visitRow['notes'] ?? ''
+    ];
+  }
+?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1184,6 +1443,7 @@
     }
 
     .visit-form input,
+    .visit-form select,
     .visit-form textarea {
       width: 100%;
       padding: 10px 12px;
@@ -1193,6 +1453,10 @@
       color: var(--text);
       font: inherit;
       font-weight: 400;
+    }
+
+    .visit-form input[type="checkbox"] {
+      width: auto;
     }
 
     .btn-primary-sm {
@@ -1388,10 +1652,45 @@
 
         <section class="panel">
           <header class="panel-head">
+            <h3>Pregnancy profile</h3>
+            <span class="muted" id="profile-for"></span>
+          </header>
+          <form id="profile-form" class="visit-form">
+            <input type="hidden" name="csrf" value="<?php echo htmlspecialchars($_SESSION['patient_records_csrf'], ENT_QUOTES, 'UTF-8'); ?>" />
+            <input type="hidden" name="patient_email" />
+            <div class="visit-form-grid">
+              <label>Expected due date
+                <input type="date" name="edd" required />
+              </label>
+              <label>Next visit
+                <input type="date" name="next_visit" />
+              </label>
+              <label>Assigned provider
+                <select name="doctor" required>
+                  <option value="">Choose a provider</option>
+                  <option value="Dr. Ana Villareal">Dr. Ana Villareal</option>
+                  <option value="Dr. Mark Reyes">Dr. Mark Reyes</option>
+                  <option value="Rosa Lim">Rosa Lim</option>
+                  <option value="Carla Dizon">Carla Dizon</option>
+                </select>
+              </label>
+              <label class="full">
+                <span><input type="checkbox" name="follow_up" value="1" /> Flag for follow-up</span>
+              </label>
+            </div>
+            <button type="submit" class="btn-primary-sm">Save pregnancy profile</button>
+            <p class="form-msg" id="profile-msg" role="status"></p>
+          </form>
+        </section>
+
+        <section class="panel">
+          <header class="panel-head">
             <h3>Record a visit</h3>
             <span class="muted" id="form-for"></span>
           </header>
           <form id="visit-form" class="visit-form">
+            <input type="hidden" name="csrf" value="<?php echo htmlspecialchars($_SESSION['patient_records_csrf'], ENT_QUOTES, 'UTF-8'); ?>" />
+            <input type="hidden" name="patient_email" />
             <div class="visit-form-grid">
               <label>Visit date
                 <input type="date" name="date" required />
@@ -1500,31 +1799,7 @@
   </script>
   <script>
     (function () {
-      var PATIENTS = [
-        { name: "Maria Santos", phone: "0917 555 0142", edd: "2027-02-09", next: "2026-11-20", doctor: "Dr. Ana Villareal", flag: false,
-          visits: [
-            { date: "2026-08-10", weeks: 14, bp: "108/68", weight: 56.4, fhr: 152, notes: "Routine check. Labs ordered." },
-            { date: "2026-09-21", weeks: 20, bp: "110/70", weight: 58.2, fhr: 148, notes: "Anatomy scan scheduled." },
-            { date: "2026-10-19", weeks: 24, bp: "112/72", weight: 60.1, fhr: 146, notes: "Glucose screening ordered." }
-          ] },
-        { name: "Jenna Reyes", phone: "0918 555 0236", edd: "2026-12-28", next: "2026-11-18", doctor: "Midwife Rosa Lim", flag: true,
-          visits: [
-            { date: "2026-09-07", weeks: 24, bp: "118/76", weight: 66.0, fhr: 144, notes: "Baby head position checked." },
-            { date: "2026-10-12", weeks: 29, bp: "120/78", weight: 68.4, fhr: 142, notes: "Blood pressure slightly high. Repeat in one week." },
-            { date: "2026-11-02", weeks: 32, bp: "122/80", weight: 70.1, fhr: 140, notes: "Birth plan discussed." }
-          ] },
-        { name: "Carla Ramos", phone: "0922 555 0609", edd: "2027-05-31", next: "2026-11-17", doctor: "Dr. Ana Villareal", flag: false,
-          visits: [
-            { date: "2026-10-05", weeks: 6, bp: "106/66", weight: 54.0, fhr: 165, notes: "First prenatal visit. Labs ordered." },
-            { date: "2026-10-26", weeks: 9, bp: "108/68", weight: 55.2, fhr: 160, notes: "Initial labs reviewed." }
-          ] },
-        { name: "Irene Bautista", phone: "0924 555 0826", edd: "2027-04-03", next: "2026-11-26", doctor: "Dr. Ana Villareal", flag: false,
-          visits: [
-            { date: "2026-08-05", weeks: 5, bp: "104/66", weight: 55.0, fhr: 170, notes: "Pregnancy confirmed. Labs ordered." },
-            { date: "2026-09-16", weeks: 11, bp: "108/70", weight: 57.4, fhr: 158, notes: "Routine check." },
-            { date: "2026-10-21", weeks: 16, bp: "110/72", weight: 59.8, fhr: 150, notes: "Anatomy scan due. Reported mild back pain." }
-          ] }
-      ];
+      var PATIENTS = <?php echo json_encode(array_values($patients), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
 
       var DAY = 86400000;
       var today = new Date();
@@ -1535,6 +1810,8 @@
       var visitRows = document.getElementById("visit-rows");
       var form = document.getElementById("visit-form");
       var msg = document.getElementById("form-msg");
+      var profileForm = document.getElementById("profile-form");
+      var profileMsg = document.getElementById("profile-msg");
 
       function parse(iso) {
         var p = iso.split("-");
@@ -1546,11 +1823,13 @@
       }
 
       function weeksNow(p) {
+        if (!p.edd) return null;
         var daysLeft = Math.round((parse(p.edd) - today) / DAY);
         return 40 - Math.round(daysLeft / 7);
       }
 
       function daysToDue(p) {
+        if (!p.edd) return null;
         return Math.round((parse(p.edd) - today) / DAY);
       }
 
@@ -1572,7 +1851,9 @@
           var name = document.createElement("strong");
           name.textContent = p.name;
           var sub = document.createElement("small");
-          sub.textContent = "Week " + weeksNow(p) + " · Due " + fmt(p.edd);
+          sub.textContent = p.edd
+            ? "Week " + weeksNow(p) + " · Due " + fmt(p.edd)
+            : "Pregnancy profile not set";
           info.appendChild(name);
           info.appendChild(sub);
           btn.appendChild(info);
@@ -1590,6 +1871,15 @@
 
       function renderVisits(p) {
         visitRows.innerHTML = "";
+        if (!p.visits.length) {
+          var emptyRow = document.createElement("tr");
+          var emptyCell = document.createElement("td");
+          emptyCell.colSpan = 6;
+          emptyCell.textContent = "No prenatal visits recorded yet.";
+          emptyRow.appendChild(emptyCell);
+          visitRows.appendChild(emptyRow);
+          return;
+        }
         p.visits.forEach(function (v) {
           var tr = document.createElement("tr");
           [fmt(v.date), String(v.weeks), v.bp, v.weight.toFixed(1), String(v.fhr) + " bpm", v.notes].forEach(function (text) {
@@ -1603,16 +1893,38 @@
 
       function renderDetail() {
         var p = PATIENTS[selected];
+        if (!p) {
+          document.getElementById("r-title").textContent = "No patient accounts";
+          document.getElementById("r-sub").textContent = "";
+          document.getElementById("r-weeks").textContent = "—";
+          document.getElementById("r-edd").textContent = "—";
+          document.getElementById("r-next").textContent = "—";
+          document.getElementById("r-doctor").textContent = "—";
+          document.getElementById("r-flag").textContent = "";
+          document.getElementById("form-for").textContent = "Register a patient account before recording prenatal information.";
+          profileForm.querySelector('button[type="submit"]').disabled = true;
+          form.querySelector('button[type="submit"]').disabled = true;
+          renderVisits({ visits: [] });
+          renderList();
+          return;
+        }
         document.getElementById("r-title").textContent = p.name;
         document.getElementById("r-sub").textContent = p.phone;
-        document.getElementById("r-weeks").textContent = weeksNow(p);
-        document.getElementById("r-edd").textContent = fmt(p.edd);
-        document.getElementById("r-next").textContent = fmt(p.next);
-        document.getElementById("r-doctor").textContent = p.doctor;
+        document.getElementById("r-weeks").textContent = p.edd ? weeksNow(p) : "—";
+        document.getElementById("r-edd").textContent = p.edd ? fmt(p.edd) : "Not set";
+        document.getElementById("r-next").textContent = p.next ? fmt(p.next) : "Not scheduled";
+        document.getElementById("r-doctor").textContent = p.doctor || "Not assigned";
         document.getElementById("form-for").textContent = "For " + p.name;
-        document.getElementById("r-flag").textContent = p.flag
-          ? "Flagged for follow-up. Review the latest blood pressure reading at the next visit."
-          : "";
+        document.getElementById("r-flag").textContent = p.flag ? "Flagged for follow-up by the care team." : "";
+        profileForm.elements["patient_email"].value = p.email;
+        profileForm.elements["edd"].value = p.edd || "";
+        profileForm.elements["next_visit"].value = p.next || "";
+        profileForm.elements["doctor"].value = p.doctor || "";
+        profileForm.elements["follow_up"].checked = p.flag;
+        profileForm.querySelector('button[type="submit"]').disabled = false;
+        form.elements["patient_email"].value = p.email;
+        form.querySelector('button[type="submit"]').disabled = !p.edd;
+        document.getElementById("profile-for").textContent = p.name;
         renderVisits(p);
         renderList();
       }
@@ -1620,14 +1932,15 @@
       function renderStats() {
         var month = today.getMonth();
         var year = today.getFullYear();
-        var active = PATIENTS.length;
+        var active = 0;
         var due = 0;
         var visits = 0;
         var flagged = 0;
 
         PATIENTS.forEach(function (p) {
           var d = daysToDue(p);
-          if (d >= 0 && d <= 92) due++;
+          if (p.edd) active++;
+          if (d !== null && d >= 0 && d <= 92) due++;
           if (p.flag) flagged++;
           p.visits.forEach(function (v) {
             var vd = parse(v.date);
@@ -1648,6 +1961,41 @@
         renderDetail();
       });
 
+      profileForm.addEventListener("submit", function (e) {
+        e.preventDefault();
+        if (!profileForm.checkValidity()) {
+          profileForm.reportValidity();
+          profileMsg.className = "form-msg error";
+          profileMsg.textContent = "Complete the pregnancy profile fields.";
+          return;
+        }
+        var patient = PATIENTS[selected];
+        if (!patient) return;
+        var button = profileForm.querySelector('button[type="submit"]');
+        button.disabled = true;
+        var request = new FormData(profileForm);
+        request.append("action", "profile");
+        fetch(window.location.pathname, { method: "POST", credentials: "same-origin", body: request })
+          .then(function (response) {
+            return response.json().then(function (data) {
+              if (!response.ok) throw new Error(data.message || "We could not save the pregnancy profile.");
+              patient.edd = data.profile.edd;
+              patient.next = data.profile.next;
+              patient.doctor = data.profile.doctor;
+              patient.flag = data.profile.flag;
+              profileMsg.className = "form-msg";
+              profileMsg.textContent = data.message;
+              renderDetail();
+              renderStats();
+            });
+          }).catch(function (error) {
+            profileMsg.className = "form-msg error";
+            profileMsg.textContent = error.message;
+          }).then(function () {
+            button.disabled = false;
+          });
+      });
+
       form.addEventListener("submit", function (e) {
         e.preventDefault();
         if (!form.checkValidity()) {
@@ -1656,23 +2004,35 @@
           msg.textContent = "Please complete the highlighted fields.";
           return;
         }
-        var el = form.elements;
         var p = PATIENTS[selected];
-        p.visits.push({
-          date: el["date"].value,
-          weeks: Number(el["weeks"].value),
-          bp: el["bp"].value.trim(),
-          weight: Number(el["weight"].value),
-          fhr: Number(el["fhr"].value),
-          notes: el["notes"].value.trim() || "No notes"
-        });
-        sortVisits(p);
-        msg.className = "form-msg";
-        msg.textContent = "Visit saved for " + p.name + ".";
-        form.reset();
-        el["date"].value = todayIso();
-        renderDetail();
-        renderStats();
+        if (!p || !p.edd) {
+          msg.className = "form-msg error";
+          msg.textContent = "Save a pregnancy profile before recording a visit.";
+          return;
+        }
+        var button = form.querySelector('button[type="submit"]');
+        button.disabled = true;
+        var request = new FormData(form);
+        request.append("action", "visit");
+        fetch(window.location.pathname, { method: "POST", credentials: "same-origin", body: request })
+          .then(function (response) {
+            return response.json().then(function (data) {
+              if (!response.ok) throw new Error(data.message || "We could not save the visit.");
+              p.visits.push(data.visit);
+              sortVisits(p);
+              msg.className = "form-msg";
+              msg.textContent = data.message;
+              form.reset();
+              form.elements["date"].value = todayIso();
+              renderDetail();
+              renderStats();
+            });
+          }).catch(function (error) {
+            msg.className = "form-msg error";
+            msg.textContent = error.message;
+          }).then(function () {
+            button.disabled = false;
+          });
       });
 
       function todayIso() {
@@ -1693,11 +2053,16 @@
       if (!button) return;
       button.addEventListener("click", function () {
         if (window.confirm("Sign out of the Healthfort admin pages?")) {
-          window.location.href = "haven-lying-in-clinic.html";
+          window.location.href = "../logout.php";
         }
       });
     })();
   </script>
 
+  <script>
+    window.addEventListener("pageshow", function (event) {
+      if (event.persisted) window.location.reload();
+    });
+  </script>
 </body>
 </html>

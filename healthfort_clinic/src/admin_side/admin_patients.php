@@ -1,3 +1,98 @@
+<?php
+  session_start();
+  header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+  header('Pragma: no-cache');
+  header('Expires: 0');
+  if (($_SESSION['user_role'] ?? '') !== 'admin') {
+    header('Location: ../login.php', true, 303);
+    exit;
+  }
+
+  require_once __DIR__ . '/../../db/conn.php';
+  require_once __DIR__ . '/../../db/patient_records_schema.php';
+  mysqli_report(MYSQLI_REPORT_OFF);
+  if (!ensurePatientRecordTables($conn)) {
+    http_response_code(500);
+    exit('Patient records are temporarily unavailable.');
+  }
+
+  $patientsResult = mysqli_query(
+    $conn,
+    "SELECT s.firstname, s.middlename, s.surname, s.email, s.phone,
+            TIMESTAMPDIFF(YEAR, s.dob, CURDATE()) AS age,
+            DATE_FORMAT(p.estimated_due_date, '%Y-%m-%d') AS edd,
+            DATE_FORMAT(p.next_visit, '%Y-%m-%d') AS next_visit,
+            p.assigned_provider,
+            COALESCE(a.appointment_count, 0) AS appointment_count,
+            COALESCE(v.visit_count, 0) AS visit_count,
+            DATE_FORMAT(
+              (SELECT MIN(ap.appointment_date) FROM patient_appointments ap
+               WHERE ap.patient_email = s.email
+                 AND ap.status IN ('Waiting', 'Confirmed')
+                 AND ap.appointment_date >= CURDATE()),
+              '%Y-%m-%d'
+            ) AS next_appointment,
+            (SELECT ap.doctor FROM patient_appointments ap
+             WHERE ap.patient_email = s.email
+             ORDER BY ap.created_at DESC, ap.id DESC LIMIT 1) AS latest_doctor,
+            (SELECT pv.notes FROM patient_prenatal_visits pv
+             WHERE pv.patient_email = s.email
+             ORDER BY pv.visit_date DESC, pv.id DESC LIMIT 1) AS latest_notes
+     FROM signup_tbl s
+     LEFT JOIN patient_pregnancy_profiles p ON p.patient_email = s.email
+     LEFT JOIN (
+       SELECT patient_email, COUNT(*) AS appointment_count
+       FROM patient_appointments GROUP BY patient_email
+     ) a ON a.patient_email = s.email
+     LEFT JOIN (
+       SELECT patient_email, COUNT(*) AS visit_count
+       FROM patient_prenatal_visits GROUP BY patient_email
+     ) v ON v.patient_email = s.email
+     ORDER BY s.surname, s.firstname"
+  );
+  if ($patientsResult === false) {
+    error_log('Admin patient list query failed: ' . mysqli_error($conn));
+    http_response_code(500);
+    exit('Patient information is temporarily unavailable.');
+  }
+
+  $patients = [];
+  while ($patient = mysqli_fetch_assoc($patientsResult)) {
+    $appointmentCount = (int) $patient['appointment_count'];
+    $visitCount = (int) $patient['visit_count'];
+    $activityDetails = $appointmentCount . ' appointment(s) · ' . $visitCount . ' prenatal visit(s)';
+    $notes = trim((string) ($patient['latest_notes'] ?? ''));
+    $patients[] = [
+      'name' => trim($patient['firstname'] . ' '
+        . ($patient['middlename'] ? $patient['middlename'] . ' ' : '')
+        . $patient['surname']),
+      'email' => $patient['email'],
+      'age' => (int) $patient['age'] . ' years',
+      'phone' => $patient['phone'],
+      'appointmentCount' => $appointmentCount,
+      'visitCount' => $visitCount,
+      'stage' => $patient['edd'] !== null
+        ? 'Prenatal'
+        : ($appointmentCount > 0 ? 'Appointments' : 'Registered'),
+      'detail' => $appointmentCount > 0 || $visitCount > 0
+        ? $activityDetails
+        : 'No appointments or visits recorded yet.',
+      'edd' => $patient['edd'] ?? '',
+      'next' => $patient['next_visit'] ?? $patient['next_appointment'] ?? '',
+      'doctor' => $patient['assigned_provider'] ?: ($patient['latest_doctor'] ?: 'Not assigned'),
+      'notes' => $notes !== '' ? $notes : $activityDetails
+    ];
+  }
+  $patientsJson = json_encode(
+    $patients,
+    JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP
+  );
+  if ($patientsJson === false) {
+    error_log('Admin patient list JSON encoding failed: ' . json_last_error_msg());
+    http_response_code(500);
+    exit('Patient information is temporarily unavailable.');
+  }
+?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1288,29 +1383,28 @@
         </section>
 
         <section class="stats">
-          <article class="stat-card"><p class="stat-label">Total patients</p><p class="stat-value" id="stat-total">0</p></article>
-          <article class="stat-card"><p class="stat-label">Prenatal</p><p class="stat-value" id="stat-prenatal">0</p></article>
-          <article class="stat-card"><p class="stat-label">Postnatal and newborn</p><p class="stat-value" id="stat-postnatal">0</p></article>
-          <article class="stat-card"><p class="stat-label">Family planning</p><p class="stat-value" id="stat-family">0</p></article>
+          <article class="stat-card"><p class="stat-label">Registered accounts</p><p class="stat-value" id="stat-total">0</p></article>
+          <article class="stat-card"><p class="stat-label">With appointment requests</p><p class="stat-value" id="stat-appointments">0</p></article>
+          <article class="stat-card"><p class="stat-label">Prenatal profiles</p><p class="stat-value" id="stat-prenatal">0</p></article>
+          <article class="stat-card"><p class="stat-label">No appointments yet</p><p class="stat-value" id="stat-inactive">0</p></article>
         </section>
 
         <section class="patients-layout">
           <article class="panel">
             <div class="toolbar">
-              <input type="search" id="search" placeholder="Search patient name" aria-label="Search patient" />
+              <input type="search" id="search" placeholder="Search patient name or email" aria-label="Search patient" />
               <select id="filter-stage" aria-label="Filter by stage">
-                <option value="">All stages</option>
+                <option value="">All accounts</option>
                 <option value="Prenatal">Prenatal</option>
-                <option value="Postnatal">Postnatal</option>
-                <option value="Newborn">Newborn</option>
-                <option value="Family planning">Family planning</option>
+                <option value="Appointments">Appointments</option>
+                <option value="Registered">Registered</option>
               </select>
               <select id="filter-doctor" aria-label="Filter by doctor or midwife">
                 <option value="">All doctors and midwives</option>
                 <option value="Dr. Ana Villareal">Dr. Ana Villareal</option>
                 <option value="Dr. Mark Reyes">Dr. Mark Reyes</option>
-                <option value="Midwife Rosa Lim">Midwife Rosa Lim</option>
-                <option value="Midwife Carla Dizon">Midwife Carla Dizon</option>
+                <option value="Rosa Lim">Rosa Lim</option>
+                <option value="Carla Dizon">Carla Dizon</option>
               </select>
               <button type="button" class="act" id="clear-filters">Clear</button>
             </div>
@@ -1320,8 +1414,9 @@
                 <thead>
                   <tr>
                     <th scope="col">Patient</th>
+                    <th scope="col">Email</th>
                     <th scope="col">Mobile</th>
-                    <th scope="col">Stage</th>
+                    <th scope="col">Account activity</th>
                     <th scope="col">Next visit</th>
                     <th scope="col">Assigned to</th>
                   </tr>
@@ -1443,18 +1538,8 @@
   </script>
   <script>
     (function () {
-      var PATIENTS = [
-        { name: "Maria Santos", age: "34 years", phone: "0917 555 0142", stage: "Prenatal", detail: "28 weeks", edd: "2027-02-09", next: "2026-11-20", doctor: "Dr. Ana Villareal", notes: "Blood pressure normal at the last visit. Continue iron supplements." },
-        { name: "Jenna Reyes", age: "29 years", phone: "0918 555 0236", stage: "Prenatal", detail: "34 weeks", edd: "2026-12-28", next: "2026-11-18", doctor: "Midwife Rosa Lim", notes: "Baby is head down. Discuss the birth plan at the next visit." },
-        { name: "Carla Ramos", age: "26 years", phone: "0922 555 0609", stage: "Prenatal", detail: "12 weeks", edd: "2027-05-31", next: "2026-11-17", doctor: "Dr. Ana Villareal", notes: "First trimester labs are normal. Ultrasound scheduled." },
-        { name: "Irene Bautista", age: "33 years", phone: "0924 555 0826", stage: "Prenatal", detail: "20 weeks", edd: "2027-04-03", next: "2026-11-26", doctor: "Dr. Ana Villareal", notes: "Anatomy scan due. Reported mild back pain." },
-        { name: "Ana Cruz", age: "27 years", phone: "0919 555 0318", stage: "Postnatal", detail: "Delivered Nov 16, 2026", edd: "", next: "2026-11-19", doctor: "Dr. Ana Villareal", notes: "Normal delivery. Monitor bleeding and wound care before discharge." },
-        { name: "Grace Villanueva", age: "30 years", phone: "0923 555 0713", stage: "Postnatal", detail: "Week 2 after delivery", edd: "", next: "2026-11-17", doctor: "Midwife Rosa Lim", notes: "Breastfeeding support. Follow up on the vaccine schedule." },
-        { name: "Baby Girl Cruz", age: "1 day", phone: "0919 555 0318 (mother)", stage: "Newborn", detail: "Day 1", edd: "", next: "2026-11-19", doctor: "Dr. Mark Reyes", notes: "Newborn screening completed. Hearing test scheduled." },
-        { name: "Liza Mendoza", age: "31 years", phone: "0921 555 0592", stage: "Family planning", detail: "Counseling", edd: "", next: "2026-11-24", doctor: "Midwife Carla Dizon", notes: "Discussed contraceptive options. Follow up on the chosen method." }
-      ];
-
-      var STAGE_PILL = { "Prenatal": "pill-ok", "Postnatal": "pill-wait", "Newborn": "pill-new", "Family planning": "pill-done" };
+      var PATIENTS = <?php echo $patientsJson; ?>;
+      var STAGE_PILL = { "Prenatal": "pill-ok", "Appointments": "pill-wait", "Registered": "pill-done" };
       var COLORS = ["#c2566b", "#1c4167", "#4f8f87", "#d89b2b", "#a23f54", "#6b8fb8", "#8a5a10", "#5b4f53"];
 
       var rowsEl = document.getElementById("rows");
@@ -1466,6 +1551,7 @@
       var selected = 0;
 
       function fmtDate(iso) {
+        if (!iso) return "Not scheduled";
         var p = iso.split("-");
         return new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2])).toLocaleDateString("en-US", {
           month: "short", day: "numeric", year: "numeric"
@@ -1478,18 +1564,28 @@
 
       function renderRows() {
         rowsEl.innerHTML = "";
+        if (!PATIENTS.length) {
+          var emptyRow = document.createElement("tr");
+          var emptyCell = document.createElement("td");
+          emptyCell.colSpan = 6;
+          emptyCell.textContent = "No registered patient accounts yet.";
+          emptyRow.appendChild(emptyCell);
+          rowsEl.appendChild(emptyRow);
+          return;
+        }
         PATIENTS.forEach(function (p, i) {
           var tr = document.createElement("tr");
           tr.className = "patient-row";
           tr.setAttribute("data-index", i);
           tr.setAttribute("data-name", p.name);
+          tr.setAttribute("data-email", p.email);
           tr.setAttribute("data-stage", p.stage);
           tr.setAttribute("data-doctor", p.doctor);
 
-          var cells = [p.name, p.phone, null, fmtDate(p.next), p.doctor];
+          var cells = [p.name, p.email, p.phone, null, fmtDate(p.next), p.doctor];
           cells.forEach(function (value, col) {
             var td = document.createElement("td");
-            if (col === 2) {
+            if (col === 3) {
               var pill = document.createElement("span");
               pill.className = "pill " + STAGE_PILL[p.stage];
               pill.textContent = p.stage;
@@ -1504,12 +1600,23 @@
       }
 
       function highlight() {
-        Array.prototype.forEach.call(rowsEl.querySelectorAll("tr"), function (tr) {
+        Array.prototype.forEach.call(rowsEl.querySelectorAll("tr.patient-row"), function (tr) {
           tr.classList.toggle("is-selected", Number(tr.getAttribute("data-index")) === selected);
         });
       }
 
       function renderDetail() {
+        if (!PATIENTS.length) {
+          document.getElementById("d-avatar").textContent = "";
+          document.getElementById("d-name").textContent = "No patient selected";
+          document.getElementById("d-sub").textContent = "";
+          document.getElementById("d-stage").textContent = "No registered accounts are available.";
+          document.getElementById("d-edd").textContent = "Not available";
+          document.getElementById("d-next").textContent = "Not scheduled";
+          document.getElementById("d-doctor").textContent = "Not assigned";
+          document.getElementById("d-notes").textContent = "Patient activity will appear here after an account is registered.";
+          return;
+        }
         var p = PATIENTS[selected];
         var avatar = document.getElementById("d-avatar");
         avatar.style.background = COLORS[selected % COLORS.length];
@@ -1529,11 +1636,12 @@
         var s = fStage.value;
         var d = fDoctor.value;
         var shown = 0;
-        var totals = { prenatal: 0, postnatal: 0, family: 0 };
+        var totals = { appointments: 0, prenatal: 0, inactive: 0 };
 
-        Array.prototype.forEach.call(rowsEl.querySelectorAll("tr"), function (tr) {
+        Array.prototype.forEach.call(rowsEl.querySelectorAll("tr.patient-row"), function (tr) {
           var stage = tr.getAttribute("data-stage");
-          var ok = (!q || tr.getAttribute("data-name").toLowerCase().indexOf(q) !== -1)
+          var searchText = (tr.getAttribute("data-name") + " " + tr.getAttribute("data-email")).toLowerCase();
+          var ok = (!q || searchText.indexOf(q) !== -1)
             && (!s || stage === s)
             && (!d || tr.getAttribute("data-doctor") === d);
           tr.hidden = !ok;
@@ -1541,16 +1649,16 @@
         });
 
         PATIENTS.forEach(function (p) {
+          if (p.appointmentCount > 0) totals.appointments++;
           if (p.stage === "Prenatal") totals.prenatal++;
-          if (p.stage === "Postnatal" || p.stage === "Newborn") totals.postnatal++;
-          if (p.stage === "Family planning") totals.family++;
+          if (p.appointmentCount === 0) totals.inactive++;
         });
 
         count.textContent = "Showing " + shown + " of " + PATIENTS.length;
         document.getElementById("stat-total").textContent = PATIENTS.length;
+        document.getElementById("stat-appointments").textContent = totals.appointments;
         document.getElementById("stat-prenatal").textContent = totals.prenatal;
-        document.getElementById("stat-postnatal").textContent = totals.postnatal;
-        document.getElementById("stat-family").textContent = totals.family;
+        document.getElementById("stat-inactive").textContent = totals.inactive;
       }
 
       rowsEl.addEventListener("click", function (e) {
@@ -1583,11 +1691,16 @@
       if (!button) return;
       button.addEventListener("click", function () {
         if (window.confirm("Sign out of the Healthfort admin pages?")) {
-          window.location.href = "haven-lying-in-clinic.html";
+          window.location.href = "../logout.php";
         }
       });
     })();
   </script>
 
+  <script>
+    window.addEventListener("pageshow", function (event) {
+      if (event.persisted) window.location.reload();
+    });
+  </script>
 </body>
 </html>

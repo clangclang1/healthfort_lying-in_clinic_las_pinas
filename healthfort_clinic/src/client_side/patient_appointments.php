@@ -1,3 +1,277 @@
+<?php
+  mysqli_report(MYSQLI_REPORT_OFF);
+  session_start();
+  require_once __DIR__ . '/../../db/conn.php';
+
+  if (($_SESSION['user_role'] ?? '') !== 'patient') {
+    header('Location: ../login.php', true, 303);
+    exit;
+  }
+
+  $patientEmail = $_SESSION['patient_email'] ?? $_SESSION['user_email'] ?? '';
+  if (!filter_var($patientEmail, FILTER_VALIDATE_EMAIL)) {
+    header('Location: ../login.php', true, 303);
+    exit;
+  }
+
+  if (empty($_SESSION['appointment_csrf'])) {
+    $_SESSION['appointment_csrf'] = bin2hex(random_bytes(32));
+  }
+
+  $createTable = "CREATE TABLE IF NOT EXISTS patient_appointments (
+    id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    patient_email VARCHAR(255) NOT NULL,
+    service VARCHAR(100) NOT NULL,
+    appointment_date DATE NOT NULL,
+    appointment_time TIME NOT NULL,
+    doctor VARCHAR(100) NOT NULL,
+    notes TEXT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'Waiting',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY patient_appointments_patient (patient_email),
+    KEY patient_appointments_slot (appointment_date, appointment_time, doctor, status)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+  if (!mysqli_query($conn, $createTable)) {
+    error_log('Appointment table setup failed: ' . mysqli_error($conn));
+    http_response_code(500);
+    exit('Appointments are temporarily unavailable.');
+  }
+
+  function appointmentResponse($status, $message, $data = []) {
+    http_response_code($status);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(array_merge(['message' => $message], $data));
+    exit;
+  }
+
+  if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
+    $csrf = $_POST['csrf'] ?? '';
+    if (!is_string($csrf) || !hash_equals($_SESSION['appointment_csrf'], $csrf)) {
+      appointmentResponse(403, 'Your session expired. Refresh the page and try again.');
+    }
+
+    $action = $_POST['action'] ?? '';
+    if ($action === 'cancel') {
+      $appointmentId = filter_var($_POST['id'] ?? '', FILTER_VALIDATE_INT);
+      if (!$appointmentId || $appointmentId < 1) {
+        appointmentResponse(400, 'Select a valid appointment to cancel.');
+      }
+
+      $cancel = mysqli_prepare(
+        $conn,
+        "UPDATE patient_appointments SET status = 'Cancelled'
+         WHERE id = ? AND patient_email = ? AND status IN ('Waiting', 'Confirmed')"
+      );
+      if (!$cancel) {
+        error_log('Appointment cancellation preparation failed: ' . mysqli_error($conn));
+        appointmentResponse(500, 'We could not cancel this appointment right now.');
+      }
+      mysqli_stmt_bind_param($cancel, 'is', $appointmentId, $patientEmail);
+      if (!mysqli_stmt_execute($cancel)) {
+        error_log('Appointment cancellation failed: ' . mysqli_stmt_error($cancel));
+        mysqli_stmt_close($cancel);
+        appointmentResponse(500, 'We could not cancel this appointment right now.');
+      }
+      $changed = mysqli_stmt_affected_rows($cancel) === 1;
+      mysqli_stmt_close($cancel);
+      if (!$changed) {
+        appointmentResponse(409, 'This appointment can no longer be cancelled.');
+      }
+      appointmentResponse(200, 'Appointment cancelled.');
+    }
+
+    if ($action !== 'book') {
+      appointmentResponse(400, 'Choose a valid appointment action.');
+    }
+
+    $service = is_string($_POST['service'] ?? null) ? trim($_POST['service']) : '';
+    $dateInput = is_string($_POST['date'] ?? null) ? trim($_POST['date']) : '';
+    $timeInput = is_string($_POST['time'] ?? null) ? trim($_POST['time']) : '';
+    $doctorInput = is_string($_POST['doctor'] ?? null) ? trim($_POST['doctor']) : '';
+    $notes = is_string($_POST['notes'] ?? null) ? trim($_POST['notes']) : '';
+    $services = [
+      'Prenatal check-up', 'Ultrasound and scans', 'Normal delivery',
+      'Newborn care', 'Postnatal care', 'Family planning'
+    ];
+    $times = [
+      '08:00', '08:30', '09:00', '09:30', '10:00', '10:30',
+      '11:00', '11:30', '12:00', '12:30', '13:00', '13:30',
+      '14:00', '14:30', '15:00', '15:30', '16:00', '16:30', '17:00'
+    ];
+    $schedules = [
+      'Dr. Ana Villareal' => ['days' => [1, 3, 5], 'leave' => ['2026-11-25']],
+      'Dr. Mark Reyes' => ['days' => [2, 4, 6], 'leave' => []],
+      'Rosa Lim' => ['days' => [1, 2, 3, 4, 5, 6], 'leave' => ['2026-11-18']],
+      'Carla Dizon' => ['days' => [1, 3, 5, 6], 'leave' => []]
+    ];
+    $appointmentDate = DateTime::createFromFormat('!Y-m-d', $dateInput);
+    $appointmentDateIsValid = $appointmentDate && $appointmentDate->format('Y-m-d') === $dateInput;
+    $appointmentDateTime = $appointmentDateIsValid
+      ? DateTime::createFromFormat('!Y-m-d H:i', $dateInput . ' ' . $timeInput)
+      : false;
+
+    if (!in_array($service, $services, true) || !$appointmentDateIsValid
+      || !in_array($timeInput, $times, true) || !in_array($doctorInput, array_merge([''], array_keys($schedules)), true)
+      || strlen($notes) > 2000) {
+      appointmentResponse(422, 'Please check the service, date, time, doctor, and notes.');
+    }
+    if (!$appointmentDateTime || $appointmentDateTime <= new DateTime()) {
+      appointmentResponse(422, 'Choose a future appointment date and time.');
+    }
+
+    $dayOfWeek = (int) $appointmentDate->format('w');
+    $eligibleDoctors = [];
+    foreach ($schedules as $doctorName => $schedule) {
+      if (in_array($dayOfWeek, $schedule['days'], true)
+        && !in_array($dateInput, $schedule['leave'], true)
+        && ($doctorInput === '' || $doctorInput === $doctorName)) {
+        $eligibleDoctors[] = $doctorName;
+      }
+    }
+    if (!$eligibleDoctors) {
+      appointmentResponse(422, 'No selected provider is available on that date. Please choose another date or provider.');
+    }
+
+    $appointmentTime = $timeInput . ':00';
+    $selectedDoctor = '';
+    $slotCheck = mysqli_prepare(
+      $conn,
+      "SELECT COUNT(*) FROM patient_appointments
+       WHERE appointment_date = ? AND appointment_time = ? AND doctor = ?
+         AND status IN ('Waiting', 'Confirmed')"
+    );
+    if (!$slotCheck) {
+      error_log('Appointment availability preparation failed: ' . mysqli_error($conn));
+      appointmentResponse(500, 'We could not check appointment availability right now.');
+    }
+    foreach ($eligibleDoctors as $doctorName) {
+      mysqli_stmt_bind_param($slotCheck, 'sss', $dateInput, $appointmentTime, $doctorName);
+      if (!mysqli_stmt_execute($slotCheck)) {
+        error_log('Appointment availability check failed: ' . mysqli_stmt_error($slotCheck));
+        mysqli_stmt_close($slotCheck);
+        appointmentResponse(500, 'We could not check appointment availability right now.');
+      }
+      $slotResult = mysqli_stmt_get_result($slotCheck);
+      if ($slotResult === false) {
+        error_log('Appointment availability result failed: ' . mysqli_stmt_error($slotCheck));
+        mysqli_stmt_close($slotCheck);
+        appointmentResponse(500, 'We could not check appointment availability right now.');
+      }
+      $slotRow = mysqli_fetch_row($slotResult);
+      mysqli_free_result($slotResult);
+      if ($slotRow && (int) $slotRow[0] === 0) {
+        $selectedDoctor = $doctorName;
+        break;
+      }
+    }
+    mysqli_stmt_close($slotCheck);
+    if ($selectedDoctor === '') {
+      appointmentResponse(409, 'That time was just booked. Please choose another time.');
+    }
+
+    $notesForDatabase = $notes === '' ? null : $notes;
+    $insert = mysqli_prepare(
+      $conn,
+      'INSERT INTO patient_appointments (patient_email, service, appointment_date, appointment_time, doctor, notes)
+       VALUES (?, ?, ?, ?, ?, ?)'
+    );
+    if (!$insert) {
+      error_log('Appointment request preparation failed: ' . mysqli_error($conn));
+      appointmentResponse(500, 'We could not send your appointment request right now.');
+    }
+    mysqli_stmt_bind_param(
+      $insert,
+      'ssssss',
+      $patientEmail,
+      $service,
+      $dateInput,
+      $appointmentTime,
+      $selectedDoctor,
+      $notesForDatabase
+    );
+    if (!mysqli_stmt_execute($insert)) {
+      error_log('Appointment request failed: ' . mysqli_stmt_error($insert));
+      mysqli_stmt_close($insert);
+      appointmentResponse(500, 'We could not send your appointment request right now.');
+    }
+    $appointment = [
+      'id' => mysqli_insert_id($conn),
+      'date' => $dateInput,
+      'time' => date('g:i A', strtotime($appointmentTime)),
+      'slot' => $timeInput,
+      'service' => $service,
+      'doctor' => $selectedDoctor,
+      'status' => 'Waiting'
+    ];
+    mysqli_stmt_close($insert);
+    appointmentResponse(201, 'Request sent. We will contact you to confirm your visit.', ['appointment' => $appointment]);
+  }
+
+  $patientName = $_SESSION['patient_firstname'] ?? 'Patient';
+  $patientLookup = mysqli_prepare($conn, 'SELECT firstname, surname FROM signup_tbl WHERE email = ? LIMIT 1');
+  if ($patientLookup) {
+    mysqli_stmt_bind_param($patientLookup, 's', $patientEmail);
+    if (mysqli_stmt_execute($patientLookup)) {
+      $patientResult = mysqli_stmt_get_result($patientLookup);
+      $patientAccount = $patientResult ? mysqli_fetch_assoc($patientResult) : null;
+      if ($patientAccount) {
+        $patientName = trim($patientAccount['firstname'] . ' ' . $patientAccount['surname']);
+      }
+    }
+    mysqli_stmt_close($patientLookup);
+  }
+
+  $patientAppointments = [];
+  $appointmentsQuery = mysqli_prepare(
+    $conn,
+    "SELECT id, DATE_FORMAT(appointment_date, '%Y-%m-%d') AS date,
+            TIME_FORMAT(appointment_time, '%H:%i') AS slot,
+            service, doctor, status
+     FROM patient_appointments WHERE patient_email = ?
+     ORDER BY appointment_date DESC, appointment_time DESC"
+  );
+  if (!$appointmentsQuery) {
+    error_log('Patient appointments query preparation failed: ' . mysqli_error($conn));
+    http_response_code(500);
+    exit('Appointments are temporarily unavailable.');
+  }
+  mysqli_stmt_bind_param($appointmentsQuery, 's', $patientEmail);
+  if (!mysqli_stmt_execute($appointmentsQuery)) {
+    error_log('Patient appointments query failed: ' . mysqli_stmt_error($appointmentsQuery));
+    mysqli_stmt_close($appointmentsQuery);
+    http_response_code(500);
+    exit('Appointments are temporarily unavailable.');
+  }
+  $appointmentsResult = mysqli_stmt_get_result($appointmentsQuery);
+  if ($appointmentsResult === false) {
+    error_log('Patient appointments result retrieval failed: ' . mysqli_stmt_error($appointmentsQuery));
+    mysqli_stmt_close($appointmentsQuery);
+    http_response_code(500);
+    exit('Appointments are temporarily unavailable.');
+  }
+  while ($appointmentRow = mysqli_fetch_assoc($appointmentsResult)) {
+    $appointmentRow['id'] = (int) $appointmentRow['id'];
+    $appointmentRow['time'] = date('g:i A', strtotime($appointmentRow['slot']));
+    $patientAppointments[] = $appointmentRow;
+  }
+  mysqli_stmt_close($appointmentsQuery);
+
+  $bookedSlots = [];
+  $availabilityQuery = mysqli_query(
+    $conn,
+    "SELECT DATE_FORMAT(appointment_date, '%Y-%m-%d') AS date,
+            TIME_FORMAT(appointment_time, '%H:%i') AS slot, doctor
+     FROM patient_appointments WHERE status IN ('Waiting', 'Confirmed')"
+  );
+  if (!$availabilityQuery) {
+    error_log('Appointment availability query failed: ' . mysqli_error($conn));
+    http_response_code(500);
+    exit('Appointments are temporarily unavailable.');
+  }
+  while ($bookedRow = mysqli_fetch_assoc($availabilityQuery)) {
+    $bookedSlots[] = $bookedRow;
+  }
+?>
 <!DOCTYPE html>
 <html lang="en">
 
@@ -67,7 +341,7 @@
           </div>
           <time id="clock" class="clock" aria-live="off">--:--:--</time>
           <div class="quick-actions">
-            <div class="user-block"><span class="user-name">Maria Santos</span><span class="user-role">Patient</span>
+            <div class="user-block"><span class="user-name"><?php echo htmlspecialchars($patientName, ENT_QUOTES, 'UTF-8'); ?></span><span class="user-role">Patient</span>
             </div>
             <button type="button" class="profile-btn" aria-label="Profile"><svg class="profile-icon" viewBox="0 0 24 24"
                 aria-hidden="true" focusable="false">
@@ -155,6 +429,7 @@
               <h3>Book a new visit</h3>
             </header>
             <form class="form-stack" id="book-form" novalidate>
+              <input type="hidden" name="csrf" value="<?php echo htmlspecialchars($_SESSION['appointment_csrf'], ENT_QUOTES, 'UTF-8'); ?>" />
               <div class="form-grid-2">
                 <label class="full">Service
                   <select name="service" required>
@@ -213,8 +488,6 @@
           </article>
         </section>
 
-
-        <p class="sample-note">Sample data for layout purposes only.</p>
       </main>
     </div>
   </div>
@@ -302,7 +575,7 @@
       if (!button) return;
       button.addEventListener("click", function () {
         if (window.confirm("Sign out of your Healthfort account?")) {
-          window.location.href = "haven-lying-in-clinic.html";
+          window.location.href = "../logout.php";
         }
       });
     })();
@@ -315,18 +588,14 @@
         { name: "Rosa Lim", role: "Midwife", color: "#4f8f87", days: [1, 2, 3, 4, 5, 6], leave: ["2026-11-18"] },
         { name: "Carla Dizon", role: "Midwife", color: "#d89b2b", days: [1, 3, 5, 6], leave: [] }
       ];
-      var SLOTS = 18;
+      var SLOTS = 19;
       var MONTHS = ["January", "February", "March", "April", "May", "June", "July",
         "August", "September", "October", "November", "December"];
       var PILL = { "Confirmed": "pill-ok", "Waiting": "pill-wait", "Completed": "pill-done", "Cancelled": "pill-cancel" };
       var AVAIL_PILL = { "Available": "pill-ok", "Unavailable": "pill-cancel", "Not scheduled": "pill-done" };
 
-      var APPTS = [
-        { date: "2026-11-20", time: "9:00 AM", service: "Prenatal check-up", doctor: "Dr. Ana Villareal", status: "Confirmed" },
-        { date: "2026-10-19", time: "9:30 AM", service: "Prenatal check-up", doctor: "Dr. Ana Villareal", status: "Completed" },
-        { date: "2026-09-21", time: "10:00 AM", service: "Ultrasound and scans", doctor: "Dr. Ana Villareal", status: "Completed" },
-        { date: "2026-08-10", time: "9:15 AM", service: "Prenatal check-up", doctor: "Dr. Ana Villareal", status: "Completed" }
-      ];
+      var APPTS = <?php echo json_encode($patientAppointments, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
+      var BOOKINGS = <?php echo json_encode($bookedSlots, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
 
       var today = new Date();
       today.setHours(0, 0, 0, 0);
@@ -359,11 +628,33 @@
       // Open slots: the day's total, less bookings already made with that doctor.
       // The starting count is sample data so the calendar shows some variety.
       function openSlots(doc, date) {
-        var sample = (date.getDate() + doc.name.length + date.getMonth()) % 7 + 4;
-        var mine = APPTS.filter(function (a) {
-          return a.date === iso(date) && a.doctor === doc.name && a.status !== "Cancelled";
+        var booked = BOOKINGS.filter(function (a) {
+          return a.date === iso(date) && a.doctor === doc.name;
         }).length;
-        return Math.max(0, SLOTS - sample - mine);
+        return Math.max(0, SLOTS - booked);
+      }
+
+      function updateTimeAvailability() {
+        var date = dateInput.value;
+        var chosenDoctor = doctorSelect.value;
+        var timeSelect = form.elements["time"];
+        Array.prototype.forEach.call(timeSelect.options, function (option) {
+          if (!option.value || !date) {
+            option.disabled = false;
+            return;
+          }
+          var candidates = DOCTORS.filter(function (doc) {
+            return (!chosenDoctor || doc.name === chosenDoctor)
+              && statusFor(doc, parse(date)) === "Available"
+              && !BOOKINGS.some(function (booking) {
+                return booking.date === date && booking.slot === option.value && booking.doctor === doc.name;
+              });
+          });
+          option.disabled = candidates.length === 0;
+        });
+        if (timeSelect.selectedOptions.length && timeSelect.selectedOptions[0].disabled) {
+          timeSelect.value = "";
+        }
       }
 
       function renderCalendar() {
@@ -394,7 +685,7 @@
           dots.className = "cal-dots";
           var available = 0;
           DOCTORS.forEach(function (doc) {
-            if (statusFor(doc, d) === "Available") {
+            if (statusFor(doc, d) === "Available" && openSlots(doc, d) > 0) {
               available++;
               var dot = document.createElement("span");
               dot.className = "cal-dot";
@@ -418,6 +709,7 @@
         list.innerHTML = "";
         DOCTORS.forEach(function (doc) {
           var st = statusFor(doc, selected);
+          var slots = openSlots(doc, selected);
           var li = document.createElement("li");
 
           var avatar = document.createElement("span");
@@ -430,19 +722,20 @@
           var name = document.createElement("strong");
           name.textContent = doc.name;
           var sub = document.createElement("span");
-          sub.textContent = doc.role + (st === "Available" ? " · " + openSlots(doc, selected) + " slots open" : "");
+          sub.textContent = doc.role + (st === "Available" ? " · " + slots + " slots open" : "");
           info.appendChild(name);
           info.appendChild(sub);
 
           var pill = document.createElement("span");
           pill.className = "pill " + AVAIL_PILL[st];
-          pill.textContent = st;
+          pill.textContent = st === "Available" && slots === 0 ? "Fully booked" : st;
+          if (st === "Available" && slots === 0) pill.className = "pill pill-cancel";
 
           li.appendChild(avatar);
           li.appendChild(info);
           li.appendChild(pill);
 
-          if (st === "Available" && !past) {
+          if (st === "Available" && slots > 0 && !past) {
             var book = document.createElement("button");
             book.type = "button";
             book.className = "act act-complete";
@@ -452,11 +745,14 @@
           }
           list.appendChild(li);
         });
+        updateTimeAvailability();
       }
 
       function renderRows() {
         rowsEl.innerHTML = "";
-        APPTS.sort(function (a, b) { return a.date < b.date ? 1 : a.date > b.date ? -1 : 0; });
+        APPTS.sort(function (a, b) {
+          return a.date < b.date ? 1 : a.date > b.date ? -1 : a.slot < b.slot ? 1 : a.slot > b.slot ? -1 : 0;
+        });
         APPTS.forEach(function (a, i) {
           var tr = document.createElement("tr");
           [fmt(a.date), a.time, a.service, a.doctor].forEach(function (text) {
@@ -476,7 +772,7 @@
             var b = document.createElement("button");
             b.type = "button";
             b.className = "act act-cancel";
-            b.setAttribute("data-index", i);
+            b.setAttribute("data-id", a.id);
             b.textContent = "Cancel";
             act.appendChild(b);
           } else {
@@ -515,6 +811,7 @@
         if (selected.getMonth() !== view.getMonth() || selected.getFullYear() !== view.getFullYear()) {
           view = new Date(selected.getFullYear(), selected.getMonth(), 1);
         }
+        dateInput.value = iso(selected);
         renderCalendar();
         renderAvailability();
       });
@@ -525,17 +822,57 @@
         dateInput.value = iso(selected);
         doctorSelect.value = btn.getAttribute("data-doctor");
         form.scrollIntoView({ behavior: "smooth", block: "start" });
+        updateTimeAvailability();
         msg.className = "form-msg";
         msg.textContent = "Date and doctor selected. Choose a time and send your request.";
       });
 
       rowsEl.addEventListener("click", function (e) {
-        var btn = e.target.closest("button[data-index]");
+        var btn = e.target.closest("button[data-id]");
         if (!btn) return;
-        APPTS[Number(btn.getAttribute("data-index"))].status = "Cancelled";
-        renderRows();
-        renderAvailability();
+        btn.disabled = true;
+        fetch(window.location.pathname, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+          body: new URLSearchParams({
+            action: "cancel",
+            id: btn.getAttribute("data-id"),
+            csrf: form.elements["csrf"].value
+          })
+        }).then(function (response) {
+          return response.json().then(function (data) {
+            if (!response.ok) throw new Error(data.message || "We could not cancel this appointment.");
+            var appointment = APPTS.find(function (item) { return String(item.id) === btn.getAttribute("data-id"); });
+            if (appointment) appointment.status = "Cancelled";
+            BOOKINGS = BOOKINGS.filter(function (booking) {
+              return !(appointment && booking.date === appointment.date
+                && booking.slot === appointment.slot && booking.doctor === appointment.doctor);
+            });
+            msg.className = "form-msg";
+            msg.textContent = data.message;
+            renderRows();
+            renderCalendar();
+            renderAvailability();
+          });
+        }).catch(function (error) {
+          msg.className = "form-msg error";
+          msg.textContent = error.message;
+          btn.disabled = false;
+        });
       });
+
+      dateInput.addEventListener("change", function () {
+        if (dateInput.value) {
+          selected = parse(dateInput.value);
+          view = new Date(selected.getFullYear(), selected.getMonth(), 1);
+          renderCalendar();
+          renderAvailability();
+        } else {
+          updateTimeAvailability();
+        }
+      });
+      doctorSelect.addEventListener("change", updateTimeAvailability);
 
       form.addEventListener("submit", function (e) {
         e.preventDefault();
@@ -545,30 +882,37 @@
           msg.textContent = "Please complete the highlighted fields.";
           return;
         }
-        var el = form.elements;
-        var day = parse(el["date"].value);
-        var chosen = el["doctor"].value;
-        if (chosen) {
-          var doc = null;
-          DOCTORS.forEach(function (d) { if (d.name === chosen) doc = d; });
-          if (doc && statusFor(doc, day) !== "Available") {
-            msg.className = "form-msg error";
-            msg.textContent = chosen + " is not available on that date. Please pick another day or doctor.";
-            return;
-          }
-        }
-        var timeText = el["time"].options[el["time"].selectedIndex].text;
-        APPTS.push({
-          date: el["date"].value, time: timeText, service: el["service"].value,
-          doctor: chosen || "To be assigned", status: "Waiting"
+        var submitButton = form.querySelector('button[type="submit"]');
+        submitButton.disabled = true;
+        var request = new FormData(form);
+        request.append("action", "book");
+        fetch(window.location.pathname, {
+          method: "POST",
+          credentials: "same-origin",
+          body: request
+        }).then(function (response) {
+          return response.json().then(function (data) {
+            if (!response.ok) throw new Error(data.message || "We could not send your appointment request.");
+            APPTS.push(data.appointment);
+            BOOKINGS.push({
+              date: data.appointment.date,
+              slot: data.appointment.slot,
+              doctor: data.appointment.doctor
+            });
+            msg.className = "form-msg";
+            msg.textContent = data.message;
+            form.reset();
+            dateInput.value = "";
+            renderRows();
+            renderCalendar();
+            renderAvailability();
+          });
+        }).catch(function (error) {
+          msg.className = "form-msg error";
+          msg.textContent = error.message;
+        }).then(function () {
+          submitButton.disabled = false;
         });
-        msg.className = "form-msg";
-        msg.textContent = "Request sent. We will text you to confirm your visit.";
-        form.reset();
-        dateInput.value = "";
-        renderRows();
-        renderCalendar();
-        renderAvailability();
       });
 
       dateInput.min = iso(today);

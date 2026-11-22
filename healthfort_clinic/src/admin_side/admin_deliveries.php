@@ -1,3 +1,13 @@
+<?php
+  session_start();
+  header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+  header('Pragma: no-cache');
+  header('Expires: 0');
+  if (($_SESSION['user_role'] ?? '') !== 'admin') {
+    header('Location: ../login.php', true, 303);
+    exit;
+  }
+?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1703,11 +1713,16 @@
       if (!button) return;
       button.addEventListener("click", function () {
         if (window.confirm("Sign out of the Healthfort admin pages?")) {
-          window.location.href = "haven-lying-in-clinic.html";
+          window.location.href = "../logout.php";
         }
       });
     })();
   </script>
 
+  <script>
+    window.addEventListener("pageshow", function (event) {
+      if (event.persisted) window.location.reload();
+    });
+  </script>
 </body>
 </html>

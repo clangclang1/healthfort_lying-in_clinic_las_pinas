@@ -1,3 +1,118 @@
+<?php
+  session_start();
+  require_once __DIR__ . '/../../db/conn.php';
+  require_once __DIR__ . '/../../db/patient_records_schema.php';
+  mysqli_report(MYSQLI_REPORT_OFF);
+  header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+  header('Pragma: no-cache');
+  header('Expires: 0');
+
+  if (($_SESSION['user_role'] ?? '') !== 'patient') {
+    header('Location: ../login.php', true, 303);
+    exit;
+  }
+  $patientEmail = $_SESSION['patient_email'] ?? $_SESSION['user_email'] ?? '';
+  if (!filter_var($patientEmail, FILTER_VALIDATE_EMAIL)) {
+    header('Location: ../login.php', true, 303);
+    exit;
+  }
+  if (!ensurePatientRecordTables($conn)) {
+    http_response_code(500);
+    exit('Patient records are temporarily unavailable.');
+  }
+
+  $patientLookup = mysqli_prepare($conn, 'SELECT firstname, middlename, surname FROM signup_tbl WHERE email = ? LIMIT 1');
+  if (!$patientLookup) {
+    error_log('Records patient lookup preparation failed: ' . mysqli_error($conn));
+    http_response_code(500);
+    exit('Your patient information is temporarily unavailable.');
+  }
+  mysqli_stmt_bind_param($patientLookup, 's', $patientEmail);
+  if (!mysqli_stmt_execute($patientLookup)) {
+    error_log('Records patient lookup failed: ' . mysqli_stmt_error($patientLookup));
+    mysqli_stmt_close($patientLookup);
+    http_response_code(500);
+    exit('Your patient information is temporarily unavailable.');
+  }
+  $patientResult = mysqli_stmt_get_result($patientLookup);
+  if ($patientResult === false) {
+    error_log('Records patient result retrieval failed: ' . mysqli_stmt_error($patientLookup));
+    mysqli_stmt_close($patientLookup);
+    http_response_code(500);
+    exit('Your patient information is temporarily unavailable.');
+  }
+  $patientAccount = mysqli_fetch_assoc($patientResult);
+  mysqli_stmt_close($patientLookup);
+  if (!$patientAccount) {
+    header('Location: ../login.php', true, 303);
+    exit;
+  }
+  $patientName = trim($patientAccount['firstname'] . ' '
+    . ($patientAccount['middlename'] ? $patientAccount['middlename'] . ' ' : '')
+    . $patientAccount['surname']);
+
+  $profileQuery = mysqli_prepare(
+    $conn,
+    "SELECT DATE_FORMAT(estimated_due_date, '%Y-%m-%d') AS edd
+     FROM patient_pregnancy_profiles WHERE patient_email = ? LIMIT 1"
+  );
+  if (!$profileQuery) {
+    error_log('Records pregnancy profile preparation failed: ' . mysqli_error($conn));
+    http_response_code(500);
+    exit('Pregnancy information is temporarily unavailable.');
+  }
+  mysqli_stmt_bind_param($profileQuery, 's', $patientEmail);
+  if (!mysqli_stmt_execute($profileQuery)) {
+    error_log('Records pregnancy profile query failed: ' . mysqli_stmt_error($profileQuery));
+    mysqli_stmt_close($profileQuery);
+    http_response_code(500);
+    exit('Pregnancy information is temporarily unavailable.');
+  }
+  $profileResult = mysqli_stmt_get_result($profileQuery);
+  if ($profileResult === false) {
+    error_log('Records pregnancy profile result retrieval failed: ' . mysqli_stmt_error($profileQuery));
+    mysqli_stmt_close($profileQuery);
+    http_response_code(500);
+    exit('Pregnancy information is temporarily unavailable.');
+  }
+  $pregnancyProfile = mysqli_fetch_assoc($profileResult);
+  mysqli_stmt_close($profileQuery);
+
+  $visits = [];
+  $visitsQuery = mysqli_prepare(
+    $conn,
+    "SELECT DATE_FORMAT(visit_date, '%Y-%m-%d') AS date, weeks,
+            blood_pressure AS bp, weight, fetal_heart_rate AS fhr, notes
+     FROM patient_prenatal_visits WHERE patient_email = ? ORDER BY visit_date DESC"
+  );
+  if (!$visitsQuery) {
+    error_log('Patient records visits preparation failed: ' . mysqli_error($conn));
+    http_response_code(500);
+    exit('Prenatal visits are temporarily unavailable.');
+  }
+  mysqli_stmt_bind_param($visitsQuery, 's', $patientEmail);
+  if (!mysqli_stmt_execute($visitsQuery)) {
+    error_log('Patient records visits query failed: ' . mysqli_stmt_error($visitsQuery));
+    mysqli_stmt_close($visitsQuery);
+    http_response_code(500);
+    exit('Prenatal visits are temporarily unavailable.');
+  }
+  $visitsResult = mysqli_stmt_get_result($visitsQuery);
+  if ($visitsResult === false) {
+    error_log('Patient records visits result retrieval failed: ' . mysqli_stmt_error($visitsQuery));
+    mysqli_stmt_close($visitsQuery);
+    http_response_code(500);
+    exit('Prenatal visits are temporarily unavailable.');
+  }
+  while ($visit = mysqli_fetch_assoc($visitsResult)) {
+    $visit['weeks'] = (int) $visit['weeks'];
+    $visit['weight'] = (float) $visit['weight'];
+    $visit['fhr'] = (int) $visit['fhr'];
+    $visit['notes'] = $visit['notes'] ?? '';
+    $visits[] = $visit;
+  }
+  mysqli_stmt_close($visitsQuery);
+?>
 <!DOCTYPE html>
 <html lang="en">
 
@@ -66,7 +181,7 @@
           </div>
           <time id="clock" class="clock" aria-live="off">--:--:--</time>
           <div class="quick-actions">
-            <div class="user-block"><span class="user-name">Maria Santos</span><span class="user-role">Patient</span>
+            <div class="user-block"><span class="user-name"><?php echo htmlspecialchars($patientName, ENT_QUOTES, 'UTF-8'); ?></span><span class="user-role">Patient</span>
             </div>
             <button type="button" class="profile-btn" aria-label="Profile"><svg class="profile-icon" viewBox="0 0 24 24"
                 aria-hidden="true" focusable="false">
@@ -85,6 +200,7 @@
         <section class="page-head">
           <h2>My records</h2>
           <p class="muted">Your visit history and documents from Healthfort.</p>
+          <p class="muted" id="pregnancy-summary"></p>
         </section>
 
         <section class="stats">
@@ -133,18 +249,11 @@
               <h3>Documents</h3>
             </header>
             <ul class="doc-list">
-              <li><span><strong>Blood test results</strong><small>Aug 10, 2026</small></span><span
-                  class="pill pill-ok">Available</span></li>
-              <li><span><strong>Ultrasound report</strong><small>Sep 21, 2026</small></span><span
-                  class="pill pill-ok">Available</span></li>
-              <li><span><strong>Glucose screening</strong><small>Oct 19, 2026</small></span><span
-                  class="pill pill-wait">Pending</span></li>
+              <li><span><strong>Clinic documents</strong><small>Documents will appear here when available.</small></span></li>
             </ul>
           </article>
         </section>
 
-
-        <p class="sample-note">Sample data for layout purposes only.</p>
       </main>
     </div>
   </div>
@@ -232,18 +341,15 @@
       if (!button) return;
       button.addEventListener("click", function () {
         if (window.confirm("Sign out of your Healthfort account?")) {
-          window.location.href = "haven-lying-in-clinic.html";
+          window.location.href = "../logout.php";
         }
       });
     })();
   </script>
   <script>
     (function () {
-      var VISITS = [
-        { date: "2026-08-10", weeks: 14, bp: "108/68", weight: 56.4, fhr: 152, notes: "Routine check. Labs ordered." },
-        { date: "2026-09-21", weeks: 20, bp: "110/70", weight: 58.2, fhr: 148, notes: "Anatomy scan scheduled." },
-        { date: "2026-10-19", weeks: 24, bp: "112/72", weight: 60.1, fhr: 146, notes: "Glucose screening ordered." }
-      ];
+      var VISITS = <?php echo json_encode($visits, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
+      var EDD = <?php echo json_encode($pregnancyProfile['edd'] ?? null, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
 
       function fmt(iso) {
         var p = iso.split("-");
@@ -252,23 +358,45 @@
         });
       }
 
+      var pregnancySummary = document.getElementById("pregnancy-summary");
+      if (EDD) {
+        var today = new Date();
+        today.setHours(0, 0, 0, 0);
+        var dueDateParts = EDD.split("-");
+        var dueDate = new Date(Number(dueDateParts[0]), Number(dueDateParts[1]) - 1, Number(dueDateParts[2]));
+        var daysToDue = Math.round((dueDate - today) / 86400000);
+        var weeks = 40 - Math.round(daysToDue / 7);
+        pregnancySummary.textContent = "Pregnancy profile: Week " + weeks + " · Due " + fmt(EDD);
+      } else {
+        pregnancySummary.textContent = "Your care team has not added a pregnancy profile yet.";
+      }
+
       VISITS.sort(function (a, b) { return a.date < b.date ? 1 : -1; });
       var tbody = document.getElementById("visit-rows");
-      VISITS.forEach(function (v) {
-        var tr = document.createElement("tr");
-        [fmt(v.date), String(v.weeks), v.bp, v.weight.toFixed(1), v.fhr + " bpm", v.notes].forEach(function (text) {
-          var td = document.createElement("td");
-          td.textContent = text;
-          tr.appendChild(td);
+      if (VISITS.length) {
+        VISITS.forEach(function (v) {
+          var tr = document.createElement("tr");
+          [fmt(v.date), String(v.weeks), v.bp, Number(v.weight).toFixed(1), v.fhr + " bpm", v.notes || "—"].forEach(function (text) {
+            var td = document.createElement("td");
+            td.textContent = text;
+            tr.appendChild(td);
+          });
+          tbody.appendChild(tr);
         });
-        tbody.appendChild(tr);
-      });
+      } else {
+        var emptyRow = document.createElement("tr");
+        var emptyCell = document.createElement("td");
+        emptyCell.colSpan = 6;
+        emptyCell.textContent = "No prenatal visits have been recorded yet.";
+        emptyRow.appendChild(emptyCell);
+        tbody.appendChild(emptyRow);
+      }
 
       var latest = VISITS[0];
       document.getElementById("r-visits").textContent = VISITS.length;
-      document.getElementById("r-bp").textContent = latest.bp;
-      document.getElementById("r-weight").textContent = latest.weight.toFixed(1) + " kg";
-      document.getElementById("r-fhr").textContent = latest.fhr + " bpm";
+      document.getElementById("r-bp").textContent = latest ? latest.bp : "—";
+      document.getElementById("r-weight").textContent = latest ? Number(latest.weight).toFixed(1) + " kg" : "—";
+      document.getElementById("r-fhr").textContent = latest ? latest.fhr + " bpm" : "—";
     })();
   </script>
 
