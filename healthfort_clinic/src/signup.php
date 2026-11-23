@@ -1,4 +1,4 @@
-<?php
+<!-- <?php
   require_once __DIR__ . '/../db/conn.php';
 
   mysqli_report(MYSQLI_REPORT_OFF);
@@ -190,6 +190,380 @@
 
           <label class="field">Password
             <input type="password" name="password" autocomplete="new-password" minlength="8" required />
+            <span class="hint">At least 8 characters.</span>
+          </label>
+
+          <label class="field full">Confirm password
+            <input type="password" name="confirm" autocomplete="new-password" required />
+          </label>
+
+          <label class="terms full">
+            <input type="checkbox" name="terms" required />
+            <span>I agree to the Terms of Use and Privacy Policy of Healthfort Lying-In Clinic.</span>
+          </label>
+        </div>
+        <br />
+        <button type="submit" class="btn btn-primary btn-block submit">Create account</button>
+        <br />
+        <p class="form-msg<?php echo $formMessageClass === 'error' ? ' error' : ''; ?>" id="form-msg" role="status"><?php echo htmlspecialchars($formMessage, ENT_QUOTES, 'UTF-8'); ?></p>
+      </form>
+      </div>
+
+    </div>
+  </main>
+
+  <script>
+    (function () {
+      var form = document.getElementById("signup-form");
+      var msg = document.getElementById("form-msg");
+      var password = form.elements["password"];
+      var confirm = form.elements["confirm"];
+
+      function checkMatch() {
+        confirm.setCustomValidity(confirm.value && confirm.value !== password.value ? "Passwords do not match." : "");
+      }
+
+      password.addEventListener("input", checkMatch);
+      confirm.addEventListener("input", checkMatch);
+
+      form.addEventListener("submit", function (event) {
+        checkMatch();
+        if (!document.getElementById("email-field").value) {
+          event.preventDefault();
+          msg.className = "form-msg error";
+          msg.textContent = "Please complete your email address.";
+          return;
+        }
+        if (!document.getElementById("dob-field").value) {
+          event.preventDefault();
+          msg.className = "form-msg error";
+          msg.textContent = "Please choose your date of birth.";
+          return;
+        }
+        if (!form.checkValidity()) {
+          event.preventDefault();
+          form.reportValidity();
+          msg.className = "form-msg error";
+          msg.textContent = "Please check the highlighted fields.";
+          return;
+        }
+      });
+    })();
+  </script>
+
+<script>
+    (function () {
+      var YEAR_MIN = 1920;
+      var YEAR_MAX = new Date().getFullYear();
+      var form = document.getElementById("signup-form");
+      var hidden = document.getElementById("dob-field");
+      var month = document.getElementById("dob-month");
+      var day = document.getElementById("dob-day");
+      var year = document.getElementById("dob-year");
+
+      function pad(n) {
+        return String(n).padStart(2, "0");
+      }
+
+      function daysInMonth() {
+        if (!month.value) return 31;
+        return new Date(year.value || 2000, parseInt(month.value, 10), 0).getDate();
+      }
+
+      // Rebuild a dropdown's choices, keeping the current choice when it is still valid.
+      function setOptions(select, values) {
+        var keep = select.value;
+        var placeholder = select.getAttribute("data-placeholder") || select.options[0].textContent;
+        select.innerHTML = "";
+        var first = document.createElement("option");
+        first.value = "";
+        first.textContent = placeholder;
+        select.appendChild(first);
+        values.forEach(function (v) {
+          var opt = document.createElement("option");
+          opt.value = String(v);
+          opt.textContent = String(v);
+          select.appendChild(opt);
+        });
+        select.value = keep;
+        if (select.value !== keep) select.value = "";
+      }
+
+      function refreshDays() {
+        var n = daysInMonth();
+        var values = [];
+        for (var d = 1; d <= n; d++) values.push(d);
+        setOptions(day, values);
+      }
+
+      function update() {
+        refreshDays();
+        if (month.value && day.value && year.value) {
+          hidden.value = year.value + "-" + pad(month.value) + "-" + pad(day.value);
+        } else {
+          hidden.value = "";
+        }
+      }
+
+      var years = [];
+      for (var y = YEAR_MAX; y >= YEAR_MIN; y--) years.push(y);
+      setOptions(year, years);
+      refreshDays();
+
+      month.addEventListener("change", update);
+      day.addEventListener("change", update);
+      year.addEventListener("change", update);
+
+      form.addEventListener("reset", function () {
+        setTimeout(function () {
+          refreshDays();
+          hidden.value = "";
+        }, 0);
+      });
+    })();
+  </script>
+
+<script>
+    (function () {
+      var form = document.getElementById("signup-form");
+      var hidden = document.getElementById("email-field");
+      var user = document.getElementById("email-user");
+      var provider = document.getElementById("email-provider");
+
+      function sync() {
+        var name = user.value.trim();
+        hidden.value = name ? name + "@" + provider.value : "";
+      }
+
+      user.addEventListener("input", sync);
+      provider.addEventListener("change", sync);
+      form.addEventListener("reset", function () { setTimeout(sync, 0); });
+      sync();
+    })();
+  </script>
+
+</body>
+</html> -->
+
+<?php
+  require_once __DIR__ . '/../db/conn.php';
+  require_once __DIR__ . '/../db/auth.php';
+
+  mysqli_report(MYSQLI_REPORT_OFF);
+  auth_start_session();
+  header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+  header('Pragma: no-cache');
+  header('Expires: 0');
+
+  $existingRole = $_SESSION['user_role'] ?? '';
+  if (in_array($existingRole, ['patient', 'admin'], true) && !empty($_SESSION['user_email'])) {
+    header('Location: ' . auth_dashboard_for($existingRole), true, 303);
+    exit;
+  }
+
+  if (!auth_ensure_tables($conn)) {
+    http_response_code(500);
+    exit('Registration is temporarily unavailable.');
+  }
+
+  $formMessage = '';
+  $formMessageClass = '';
+
+  if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
+    $field = function ($name) {
+      return is_string($_POST[$name] ?? null) ? trim($_POST[$name]) : '';
+    };
+    $firstname = $field('firstname');
+    $middlename = $field('middlename');
+    $surname = $field('surname');
+    $email = auth_normalize_email($field('email'));
+    $phone = preg_replace('/\s+/', '', $field('phone'));
+    $dobInput = $field('dob');
+    $password = is_string($_POST['password'] ?? null) ? $_POST['password'] : '';
+    $confirm = is_string($_POST['confirm'] ?? null) ? $_POST['confirm'] : '';
+
+    $dob = DateTime::createFromFormat('!Y-m-d', $dobInput);
+    $dobIsValid = $dob && $dob->format('Y-m-d') === $dobInput
+      && $dob <= new DateTime('today') && (int) $dob->format('Y') >= 1900;
+
+    if (!auth_csrf_valid('signup', $_POST['csrf'] ?? '')) {
+      $formMessage = 'Your session expired. Refresh the page and try again.';
+      $formMessageClass = 'error';
+    } elseif ($firstname === '' || $surname === '' || $phone === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+      $formMessage = 'Please provide valid information for all required fields.';
+      $formMessageClass = 'error';
+    } elseif (mb_strlen($firstname) > 100 || mb_strlen($middlename) > 100 || mb_strlen($surname) > 100 || strlen($email) > 255) {
+      $formMessage = 'One of your entries is too long.';
+      $formMessageClass = 'error';
+    } elseif (!preg_match('/^09[0-9]{9}$/', $phone)) {
+      $formMessage = 'Use an 11-digit mobile number, for example 0966 726 0918.';
+      $formMessageClass = 'error';
+    } elseif (!$dobIsValid) {
+      $formMessage = 'Please enter a valid date of birth.';
+      $formMessageClass = 'error';
+    } elseif (strlen($password) < 8) {
+      $formMessage = 'Your password must be at least 8 characters.';
+      $formMessageClass = 'error';
+    } elseif (strlen($password) > 72) {
+      $formMessage = 'Your password must be 72 characters or fewer.';
+      $formMessageClass = 'error';
+    } elseif ($password !== $confirm) {
+      $formMessage = 'Passwords do not match.';
+      $formMessageClass = 'error';
+    } elseif (!isset($_POST['terms'])) {
+      $formMessage = 'Please agree to the Terms of Use and Privacy Policy.';
+      $formMessageClass = 'error';
+    } else {
+      $passwordHash = password_hash($password, PASSWORD_DEFAULT);
+      $dobForDatabase = $dob->format('Y-m-d H:i:s');
+      $middlename = $middlename === '' ? null : $middlename;
+
+      $check = mysqli_prepare($conn, 'SELECT 1 FROM signup_tbl WHERE email = ? LIMIT 1');
+      $exists = false;
+      $failed = false;
+      if (!$check) {
+        error_log('Signup email check failed: ' . mysqli_error($conn));
+        $failed = true;
+      } else {
+        mysqli_stmt_bind_param($check, 's', $email);
+        $ran = mysqli_stmt_execute($check);
+        $existing = $ran ? mysqli_stmt_get_result($check) : false;
+        if (!$ran || $existing === false) {
+          error_log('Signup email check failed: ' . mysqli_stmt_error($check));
+          $failed = true;
+        } else {
+          $exists = mysqli_num_rows($existing) > 0;
+        }
+        mysqli_stmt_close($check);
+      }
+
+      if ($failed) {
+        http_response_code(500);
+        $formMessage = 'We could not process your registration right now.';
+        $formMessageClass = 'error';
+      } elseif ($exists) {
+        $formMessage = 'An account with that email address already exists.';
+        $formMessageClass = 'error';
+      } else {
+        $insert = mysqli_prepare(
+          $conn,
+          'INSERT INTO signup_tbl (firstname, middlename, surname, email, phone, dob, password) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        );
+        if (!$insert) {
+          error_log('Signup insert preparation failed: ' . mysqli_error($conn));
+          http_response_code(500);
+          $formMessage = 'We could not process your registration right now.';
+          $formMessageClass = 'error';
+        } else {
+          mysqli_stmt_bind_param($insert, 'sssssss', $firstname, $middlename, $surname, $email, $phone, $dobForDatabase, $passwordHash);
+          if (mysqli_stmt_execute($insert)) {
+            mysqli_stmt_close($insert);
+            auth_sign_in('patient', $email, $firstname);
+            header('Location: client_side/patient_dashboard.php', true, 303);
+            exit;
+          }
+          // 1062 = duplicate key: someone registered this email between the check and the insert.
+          if (mysqli_stmt_errno($insert) === 1062) {
+            $formMessage = 'An account with that email address already exists.';
+          } else {
+            error_log('Signup insert failed: ' . mysqli_stmt_error($insert));
+            http_response_code(500);
+            $formMessage = 'We could not process your registration right now.';
+          }
+          $formMessageClass = 'error';
+          mysqli_stmt_close($insert);
+        }
+      }
+    }
+  }
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Sign Up</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="../style/signup.css">
+</head>
+<body>
+
+  <main class="signup">
+    <div class="container signup-grid">
+
+      <div class="signup-main">
+        <div class="signup-intro">
+        <h1>Create your account</h1>
+        <p class="switch">Already have an account? <a href="login.php">Login</a></p>
+      </div>
+
+      <form class="form-card" id="signup-form" method="post" action="signup.php">
+        <input type="hidden" name="csrf" value="<?php echo htmlspecialchars(auth_csrf_token('signup'), ENT_QUOTES, 'UTF-8'); ?>" />
+        <div class="form-grid">
+          <label class="field">First name
+            <input type="text" name="firstname" autocomplete="given-name" required />
+          </label>
+
+          <label class="field">Middle Name (Optional)
+            <input type="text" name="middlename" autocomplete="additional-name" />
+          </label>
+
+          <label class="field full">Surname
+            <input type="text" name="surname" autocomplete="family-name" required />
+          </label>
+
+          <div class="field email-field">
+            <span id="email-label">Email address</span>
+            <div class="email-row" role="group" aria-labelledby="email-label">
+              <input type="text" id="email-user" name="emailuser" placeholder="yourname" autocomplete="username" pattern="[A-Za-z0-9._%+-]+" title="Use letters, numbers, dots, or underscores before the @" required />
+              <select id="email-provider" aria-label="Email provider" required>
+                <option value="gmail.com" selected>@gmail.com</option>
+                <option value="yahoo.com">@yahoo.com</option>
+                <option value="outlook.com">@outlook.com</option>
+                <option value="hotmail.com">@hotmail.com</option>
+                <option value="icloud.com">@icloud.com</option>
+              </select>
+            </div>
+            <input type="hidden" name="email" id="email-field" />
+          </div>
+
+          <label class="field">Mobile number
+            <input type="tel" name="phone" autocomplete="tel" placeholder="09XX XXX XXXX" pattern="09[0-9]{2} ?[0-9]{3} ?[0-9]{4}" title="Use an 11-digit mobile number, for example 0966 726 0918" required />
+          </label>
+
+          <div class="field dob-field">
+            <span id="dob-label">Date of birth</span>
+            <div class="dob-selects" role="group" aria-labelledby="dob-label">
+              <select id="dob-month" aria-label="Month">
+                <option value="">Month</option>
+                <option value="1">January</option>
+                <option value="2">February</option>
+                <option value="3">March</option>
+                <option value="4">April</option>
+                <option value="5">May</option>
+                <option value="6">June</option>
+                <option value="7">July</option>
+                <option value="8">August</option>
+                <option value="9">September</option>
+                <option value="10">October</option>
+                <option value="11">November</option>
+                <option value="12">December</option>
+              </select>
+              <select id="dob-day" aria-label="Day" data-placeholder="Day">
+                <option value="">Day</option>
+              </select>
+              <select id="dob-year" aria-label="Year" data-placeholder="Year">
+                <option value="">Year</option>
+              </select>
+            </div>
+            <input type="hidden" name="dob" id="dob-field" />
+          </div>
+
+          <label class="field">Password
+            <input type="password" name="password" autocomplete="new-password" minlength="8" maxlength="72" required />
             <span class="hint">At least 8 characters.</span>
           </label>
 

@@ -29,7 +29,7 @@
                     <div class="role-title">Patient Portal</div>
                     <div class="role-desc">View your upcoming appointments and check laboratory results</div>
                 </div>
-                <span class="role-btn">Continue as Patient</span>
+                <a class="role-btn" href="login.php?role=patient">Continue as Patient</a>
             </div>
 
             <!-- Admin Portal Card -->
@@ -38,7 +38,7 @@
                     <div class="role-title">Admin Portal </div>
                     <div class="role-desc"> Lorem ipsum </div>
                 </div>
-                <span class="role-btn">Continue as Admin</span>
+                <a class="role-btn" href="login.php?role=admin">Continue as Admin</a>
             </div>
         </div>
     </div>

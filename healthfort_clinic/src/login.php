@@ -1,4 +1,4 @@
-<?php
+<!-- <?php
   require_once __DIR__ . '/../db/conn.php';
 
   mysqli_report(MYSQLI_REPORT_OFF);
@@ -402,6 +402,204 @@
       show(window.location.hash === "#signup" ? "signup" : "login");
       window.addEventListener("hashchange", function () {
         show(window.location.hash === "#signup" ? "signup" : "login");
+      });
+    })();
+  </script>
+
+</body>
+</html> -->
+
+
+<?php
+  require_once __DIR__ . '/../db/conn.php';
+  require_once __DIR__ . '/../db/auth.php';
+
+  mysqli_report(MYSQLI_REPORT_OFF);
+  auth_start_session();
+  header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+  header('Pragma: no-cache');
+  header('Expires: 0');
+
+  // Already signed in? Go straight to the right dashboard.
+  $existingRole = $_SESSION['user_role'] ?? '';
+  if (in_array($existingRole, ['patient', 'admin'], true) && !empty($_SESSION['user_email'])) {
+    header('Location: ' . auth_dashboard_for($existingRole), true, 303);
+    exit;
+  }
+
+  if (!auth_ensure_tables($conn)) {
+    http_response_code(500);
+    exit('Sign-in is temporarily unavailable.');
+  }
+
+  $loginMessage = '';
+  $loginMessageClass = '';
+  $selectedRole = (($_GET['role'] ?? '') === 'admin') ? 'admin' : 'patient';
+
+  // Offer first-admin setup only from this computer and only while no admin exists.
+  $remoteAddress = $_SERVER['REMOTE_ADDR'] ?? '';
+  $isLocalRequest = in_array($remoteAddress, ['127.0.0.1', '::1', '::ffff:127.0.0.1'], true);
+  $showAdminSetup = false;
+  if ($isLocalRequest) {
+    $adminCount = mysqli_query($conn, "SELECT COUNT(*) AS total FROM login_tbl WHERE role = 'admin'");
+    if ($adminCount === false) {
+      error_log('Admin account count failed: ' . mysqli_error($conn));
+    } else {
+      $showAdminSetup = (int) mysqli_fetch_assoc($adminCount)['total'] === 0;
+    }
+  }
+
+  if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
+    $role = is_string($_POST['role'] ?? null) ? $_POST['role'] : '';
+    $email = auth_normalize_email(is_string($_POST['email'] ?? null) ? $_POST['email'] : '');
+    $password = is_string($_POST['password'] ?? null) ? $_POST['password'] : '';
+    $ip = auth_client_ip();
+    $selectedRole = $role === 'admin' ? 'admin' : 'patient';
+
+    if (!auth_csrf_valid('login', $_POST['csrf'] ?? '')) {
+      $loginMessage = 'Your session expired. Please try again.';
+      $loginMessageClass = 'error';
+    } elseif (!in_array($role, ['patient', 'admin'], true)) {
+      $loginMessage = 'Select a valid account type.';
+      $loginMessageClass = 'error';
+    } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($email) > 255 || $password === '') {
+      $loginMessage = 'Enter a valid email address and password.';
+      $loginMessageClass = 'error';
+    } elseif (auth_is_throttled($conn, $email, $ip)) {
+      http_response_code(429);
+      $loginMessage = 'Too many failed attempts. Please wait ' . AUTH_WINDOW_MINUTES . ' minutes and try again.';
+      $loginMessageClass = 'error';
+    } else {
+      $table = $role === 'admin' ? 'login_tbl' : 'signup_tbl';
+      $query = $role === 'admin'
+        ? "SELECT NULL AS firstname, password FROM login_tbl WHERE email = ? AND role = 'admin' LIMIT 1"
+        : 'SELECT firstname, password FROM signup_tbl WHERE email = ? LIMIT 1';
+      $stmt = mysqli_prepare($conn, $query);
+      $account = null;
+      $failed = false;
+
+      if (!$stmt) {
+        error_log('Login lookup preparation failed: ' . mysqli_error($conn));
+        $failed = true;
+      } else {
+        mysqli_stmt_bind_param($stmt, 's', $email);
+        if (!mysqli_stmt_execute($stmt)) {
+          error_log('Login lookup failed: ' . mysqli_stmt_error($stmt));
+          $failed = true;
+        } else {
+          $result = mysqli_stmt_get_result($stmt);
+          if ($result === false) {
+            error_log('Login result retrieval failed: ' . mysqli_stmt_error($stmt));
+            $failed = true;
+          } else {
+            $account = mysqli_fetch_assoc($result) ?: null;
+          }
+        }
+        mysqli_stmt_close($stmt);
+      }
+
+      if ($failed) {
+        http_response_code(500);
+        $loginMessage = 'We could not process your sign-in right now.';
+        $loginMessageClass = 'error';
+      } else {
+        // Always run password_verify so unknown emails take as long as known ones.
+        $dummyHash = '$2y$10$abcdefghijklmnopqrstuuMBlDQ5lqXVr8qG8qJqf3k8x1gJ0lq1e';
+        $passwordOk = password_verify($password, $account['password'] ?? $dummyHash);
+
+        if (!$account || !$passwordOk) {
+          auth_record_failure($conn, $email, $ip);
+          $loginMessage = 'The email or password is incorrect.';
+          $loginMessageClass = 'error';
+        } else {
+          // Upgrade the stored hash if PHP's default algorithm/cost has changed.
+          if (password_needs_rehash($account['password'], PASSWORD_DEFAULT)) {
+            $newHash = password_hash($password, PASSWORD_DEFAULT);
+            $upgrade = mysqli_prepare($conn, "UPDATE {$table} SET password = ? WHERE email = ?");
+            if ($upgrade) {
+              mysqli_stmt_bind_param($upgrade, 'ss', $newHash, $email);
+              mysqli_stmt_execute($upgrade);
+              mysqli_stmt_close($upgrade);
+            }
+          }
+          auth_clear_failures($conn, $email);
+          auth_sign_in($role, $email, $account['firstname']);
+          header('Location: ' . auth_dashboard_for($role), true, 303);
+          exit;
+        }
+      }
+    }
+  }
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Login </title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="../style/login.css">
+</head>
+<body>
+
+  <main class="signup auth-page">
+    <div class="container signup-grid">
+
+      <div class="signup-main">
+        <div class="auth-card">
+
+          <h1 class="auth-title" id="auth-title">Welcome back</h1>
+
+          <section class="auth-panel" id="panel-login">
+            <form class="auth-form" id="login-form" method="post" action="login.php" novalidate>
+              <input type="hidden" name="csrf" value="<?php echo htmlspecialchars(auth_csrf_token('login'), ENT_QUOTES, 'UTF-8'); ?>" />
+              <div class="stack">
+                <label class="field">Sign in as
+                  <select name="role" required>
+                    <option value="patient"<?php echo $selectedRole === 'patient' ? ' selected' : ''; ?>>Patient</option>
+                    <option value="admin"<?php echo $selectedRole === 'admin' ? ' selected' : ''; ?>>Admin</option>
+                  </select>
+                </label>
+                <label class="field">Email address
+                  <input type="email" name="email" autocomplete="email" maxlength="255" required />
+                </label>
+                <label class="field">Password
+                  <input type="password" name="password" autocomplete="current-password" required />
+                </label>
+              </div>
+              <button type="submit" class="btn btn-primary btn-block submit">Sign in</button>
+              <p class="form-msg<?php echo $loginMessageClass === 'error' ? ' error' : ''; ?>" id="login-msg" role="status"><?php echo htmlspecialchars($loginMessage, ENT_QUOTES, 'UTF-8'); ?></p>
+              <p class="switch">New to Healthfort? <a href="signup.php">Create an account</a></p>
+              <?php if ($showAdminSetup): ?>
+                <p class="switch"><a href="admin_setup.php">Set up the first admin account</a></p>
+              <?php endif; ?>
+              <p class="demo-note">Sign in with the email and password you registered with.</p>
+            </form>
+          </section>
+
+        </div>
+      </div>
+
+    </div>
+  </main>
+
+  <script>
+    (function () {
+      var form = document.getElementById("login-form");
+      var msg = document.getElementById("login-msg");
+      form.addEventListener("submit", function (e) {
+        if (!form.checkValidity()) {
+          e.preventDefault();
+          form.reportValidity();
+          msg.className = "form-msg error";
+          msg.textContent = "Please enter your email and password.";
+          return;
+        }
+        msg.className = "form-msg";
+        msg.textContent = "Signing you in...";
       });
     })();
   </script>
